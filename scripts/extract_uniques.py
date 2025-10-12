@@ -42,7 +42,7 @@ def extract_uniques(input_path, batters_out, pitchers_out):
         if pitcher_col is None:
             raise ValueError("Could not find a 'pitcher' column in input CSV headers: " + str(reader.fieldnames))
 
-        for i, row in enumerate(reader, start=1):
+        for row in reader:
             # Use raw values; caller can normalize if needed
             b = row.get(batter_col)
             p = row.get(pitcher_col)
@@ -75,19 +75,19 @@ def extract_uniques(input_path, batters_out, pitchers_out):
 
 def main():
     p = argparse.ArgumentParser(description='Extract unique batters and pitchers from swings CSV')
-    p.add_argument('--input', '-i', default='/Users/christopherhsu/projects/hitterarchetypes/data/raw/2025_swings.csv', help='Input CSV file')
-    p.add_argument('--batters-out', default='/Users/christopherhsu/projects/hitterarchetypes/data/raw/unique_batters.csv', help='Output CSV for batters')
-    p.add_argument('--pitchers-out', default='/Users/christopherhsu/projects/hitterarchetypes/data/raw/unique_pitchers.csv', help='Output CSV for pitchers')
+    p.add_argument('--input', '-i', required=True, help='Input CSV file')
+    p.add_argument('--batters-out', required=True, help='Output CSV for batters')
+    p.add_argument('--pitchers-out', required=True, help='Output CSV for pitchers')
     args = p.parse_args()
 
     try:
-        nb, np_ = extract_uniques(args.input, args.batters_out, args.pitchers_out)
+        num_batters, num_pitchers = extract_uniques(args.input, args.batters_out, args.pitchers_out)
     except Exception as e:
         print('Error:', e, file=sys.stderr)
         sys.exit(2)
 
-    print(f'Wrote {nb} unique batters to {args.batters_out}')
-    print(f'Wrote {np_} unique pitchers to {args.pitchers_out}')
+    print(f'Wrote {num_batters} unique batters to {args.batters_out}')
+    print(f'Wrote {num_pitchers} unique pitchers to {args.pitchers_out}')
 
 
 if __name__ == '__main__':
