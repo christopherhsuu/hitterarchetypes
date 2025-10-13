@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Sort players into files by their assigned cluster.
-
-Reads `data/player_archetypes.csv` (or --input) and writes one CSV per cluster
-into the output directory (default: data/clusters/). If a names file is found
-it will join player names so you can see who is in each group.
-
-Usage:
-  python3 scripts/sort_players_by_cluster.py
-  python3 scripts/sort_players_by_cluster.py --cluster-col cluster_k5 --names data/raw/unique_batters_with_names.csv
-"""
 from pathlib import Path
 import argparse
 import sys
@@ -30,7 +19,6 @@ def find_names_file(user_path=None):
     candidates = []
     if user_path:
         candidates.append(Path(user_path))
-    # common locations
     candidates += [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv'), Path('data/raw/unique_batters.csv'), Path('data/unique_batters.csv')]
     for p in candidates:
         if p.exists():
@@ -55,10 +43,8 @@ def main():
         print(f'ID column {id_col} not found in input. Columns: {list(df.columns)}', file=sys.stderr)
         sys.exit(2)
 
-    # detect cluster column
     cluster_col = args.cluster_col
     if cluster_col is None:
-        # prefer exact 'cluster' or 'cluster_k5', else any column starting with 'cluster'
         if 'cluster' in df.columns:
             cluster_col = 'cluster'
         else:
@@ -70,13 +56,11 @@ def main():
         print('Columns available:', list(df.columns))
         sys.exit(2)
 
-    # try to attach names
     names_path = find_names_file(args.names)
     names_df = None
     if names_path:
         try:
             names_df = pd.read_csv(names_path, dtype=str)
-            # guess columns
             name_col = None
             idname_col = None
             for c in names_df.columns:
@@ -99,16 +83,13 @@ def main():
     outdir = Path(args.out_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # merge names if present
     merged = df.copy()
     if names_df is not None:
         merged = merged.merge(names_df, on=id_col, how='left')
 
-    # ensure cluster labels are sortable
     merged[cluster_col] = merged[cluster_col].astype(str)
     clusters = sorted(merged[cluster_col].unique(), key=lambda x: (int(x) if x.isdigit() else x))
 
-    # determine which feature columns were used for clustering (try diagnostics.json)
     features_front = []
     try:
         import json
@@ -117,39 +98,32 @@ def main():
             diag = json.loads(diag_path.read_text())
             feats = diag.get('params', {}).get('features')
             if feats:
-                # keep only those that are present in the merged dataframe
                 features_front = [f for f in feats if f in merged.columns]
     except Exception:
         features_front = []
 
-    # fallback heuristic order if diagnostics not available
     if not features_front:
         heur = ['whiff_rate', 'contact_rate', 'launch_speed_mean', 'launch_angle_mean', 'bat_speed_mean', 'launch_speed_std', 'launch_angle_std', 'bat_speed_std']
         features_front = [f for f in heur if f in merged.columns]
 
-    # all other columns (preserve original order)
     other_cols = [c for c in merged.columns if c not in ([id_col, 'name', cluster_col] + features_front)]
 
     mapping_rows = []
     for cl in clusters:
         sub = merged[merged[cluster_col] == cl]
         out_fp = outdir / f'cluster_{cl}.csv'
-        # write id, name (if present), clustering features first, then the rest, and finally the cluster label
         cols = [id_col]
         if 'name' in merged.columns:
             cols.append('name')
         cols += features_front
         cols += other_cols
-        # ensure cluster_col is last
         if cluster_col not in cols:
             cols.append(cluster_col)
 
-        # only keep columns that exist
         cols = [c for c in cols if c in merged.columns]
         sub[cols].to_csv(out_fp, index=False)
         mapping_rows.append({'cluster': cl, 'count': len(sub), 'file': str(out_fp)})
 
-    # also write full mapping
     mapping_df = merged[[id_col, 'name', cluster_col]].rename(columns={cluster_col: 'cluster'})
     mapping_df.to_csv(outdir / 'batter_to_cluster.csv', index=False)
 

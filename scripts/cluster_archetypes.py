@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""
-Cluster players into archetypes using per-swing Statcast data.
-
-Enhancements:
-- Cleans zero / constant features before clustering
-- Removes player ID from feature matrix
-- Filters all-zero or missing rows
-- Preserves your silhouette diagnostics and PCA plots
-"""
-
 from pathlib import Path
 import argparse, sys, re, warnings, json
 import numpy as np
 import pandas as pd
 
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
@@ -25,7 +15,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-# ---------------- Argument parsing ----------------
 def parse_args():
     p = argparse.ArgumentParser(description='Cluster players into archetypes from Statcast swings')
     p.add_argument('--input', '-i', default='data/raw/2025_swings.csv')
@@ -42,25 +31,18 @@ def parse_args():
     p.add_argument('--min-swings', type=int, default=15)
     p.add_argument('--features', default=None)
     p.add_argument('--n-init', type=int, default=10)
-    p.add_argument('--imbalance-weight', type=float, default=0.5,
-                   help='Penalty weight for cluster size imbalance (higher penalizes uneven sizes)')
-    # NEW:
-    p.add_argument('--silhouette-tol', type=float, default=0.03,
-                   help='Accept any k with silhouette >= best - tol (e.g., 0.03 ≈ within 3 points)')
-    p.add_argument('--prefer-larger-k', action='store_true', default=True,
-                   help='If multiple ks are within tolerance, pick the largest k')
-    p.add_argument('--min-cluster-size', type=int, default=22,
-                   help='Reject ks where any cluster has fewer than this many players')
-    p.add_argument('--min-cluster-frac', type=float, default=0.03,
-                   help='Also reject ks where any cluster has fewer than this fraction of players')
+    p.add_argument('--imbalance-weight', type=float, default=0.5)
+    p.add_argument('--silhouette-tol', type=float, default=0.03)
+    p.add_argument('--prefer-larger-k', action='store_true', default=True)
+    p.add_argument('--min-cluster-size', type=int, default=22)
+    p.add_argument('--min-cluster-frac', type=float, default=0.03)
     p.add_argument('--sample-frac', type=float, default=1.0)
     return p.parse_args()
 
 
-
-# ---------------- Helper functions ----------------
 def infer_whiff_flag(desc):
-    if pd.isna(desc): return False
+    if pd.isna(desc):
+        return False
     d = str(desc).lower()
     patterns = [r"swinging_strike", r"swinging strike", r"miss", r"whiff", r"swinging_strike_blocked"]
     return any(re.search(p, d) for p in patterns)
@@ -74,12 +56,10 @@ def aggregate_features(df, player_col, desc_col, launch_speed_col, launch_angle_
     features = pd.DataFrame(index=grouped.size().index)
     features['n_swings'] = grouped.size()
 
-    # Robust whiff/miss detection combining description, events, and type columns
     whiff_flag = pd.Series(False, index=df.index)
     if desc_col in df.columns:
         desc = df[desc_col].fillna('').astype(str).str.lower()
         whiff_flag = whiff_flag | desc.str.contains(r"swinging_strike|swinging strike|swinging_strike_blocked|whiff|swing and miss|miss")
-        # capture patterns like 'swing' + 'miss'
         whiff_flag = whiff_flag | (desc.str.contains(r"swing") & desc.str.contains(r"miss|whiff"))
     if 'events' in df.columns:
         ev = df['events'].fillna('').astype(str).str.lower()
@@ -90,36 +70,30 @@ def aggregate_features(df, player_col, desc_col, launch_speed_col, launch_angle_
         whiff_flag = whiff_flag | ((t == 'S') & desc.str.contains('swing'))
 
     try:
-        features['whiff_rate'] = grouped.apply(lambda s: whiff_flag.loc[s.index].mean())
+        whiff_counts = grouped.apply(lambda s: int(whiff_flag.loc[s.index].sum()))
+        swings_counts = grouped.size()
     except Exception:
-        features['whiff_rate'] = 0.0
+        whiff_counts = df.groupby(player_col).apply(lambda s: int(whiff_flag.loc[s.index].sum()))
+        swings_counts = df.groupby(player_col).size()
 
-    # If whiff_rate is all zero (no descriptions/events present), compute a fallback 'miss_rate'
-    if features['whiff_rate'].max() == 0:
-        miss_flag = pd.Series(False, index=df.index)
-        if desc_col in df.columns:
-            desc = df[desc_col].fillna('').astype(str).str.lower()
-            miss_flag = miss_flag | desc.str.contains(r"miss|whiff|swing and miss")
-        if 'events' in df.columns:
-            ev = df['events'].fillna('').astype(str).str.lower()
-            miss_flag = miss_flag | ev.str.contains(r"miss|whiff")
-        try:
-            features['whiff_rate'] = grouped.apply(lambda s: miss_flag.loc[s.index].mean())
-        except Exception:
-            features['whiff_rate'] = 0.0
+    total_whiffs = whiff_counts.sum()
+    total_swings = swings_counts.sum()
+    p0 = float(total_whiffs) / float(total_swings) if total_swings > 0 else 0.0
+    prior_n = 50.0
+    alpha = p0 * prior_n
+    beta = (1.0 - p0) * prior_n
 
-    # Launch metrics and additional EV stats
+    shrunk_whiff = (whiff_counts + alpha) / (swings_counts + prior_n)
+    features['whiff_rate'] = shrunk_whiff.fillna(0.0)
+
     if launch_speed_col in df.columns:
-        ls = df[launch_speed_col]
         features['launch_speed_mean'] = grouped[launch_speed_col].mean()
         features['launch_speed_std'] = grouped[launch_speed_col].std().fillna(0.0)
-        # Advanced exit-velocity features
         features['launch_speed_median'] = grouped[launch_speed_col].median()
         try:
             features['launch_speed_p95'] = grouped[launch_speed_col].quantile(0.95)
         except Exception:
             features['launch_speed_p95'] = grouped[launch_speed_col].apply(lambda s: s.quantile(0.95) if len(s) > 0 else 0)
-        # percent hard-hit (>=95 mph) — guard against missing values
         try:
             features['pct_hard_hit'] = grouped[launch_speed_col].apply(lambda s: (s >= 95).mean() if len(s.dropna())>0 else 0.0)
         except Exception:
@@ -128,7 +102,6 @@ def aggregate_features(df, player_col, desc_col, launch_speed_col, launch_angle_
     if launch_angle_col in df.columns:
         features['launch_angle_mean'] = grouped[launch_angle_col].mean()
         features['launch_angle_std'] = grouped[launch_angle_col].std().fillna(0.0)
-        # Batted-ball distribution mix: ground/line/flat (gb/ld/fb)
         def bb_mix(s):
             s = s.dropna()
             return pd.Series({
@@ -136,31 +109,53 @@ def aggregate_features(df, player_col, desc_col, launch_speed_col, launch_angle_
                 'ld_pct': ((s >= 10) & (s < 25)).mean(),
                 'fb_pct': (s >= 25).mean(),
             })
-        try:
-            mix = df[[player_col, launch_angle_col]].groupby(player_col)[launch_angle_col].apply(bb_mix)
-            # join mix (it returns a DataFrame with multiindex sometimes)
-            features = features.join(mix)
-        except Exception:
-            # fallback: compute per-player via apply
-            mix2 = grouped[launch_angle_col].apply(bb_mix)
-            features = features.join(mix2)
+        mix_df = grouped[launch_angle_col].apply(lambda s: bb_mix(s))
+        if isinstance(mix_df, pd.Series) and isinstance(mix_df.index, pd.MultiIndex):
+            mix_df = mix_df.unstack(level=-1)
+        mix_df.index = mix_df.index.astype(str)
+        features = features.join(mix_df)
     if bat_speed_col in df.columns:
         features['bat_speed_mean'] = grouped[bat_speed_col].mean()
         features['bat_speed_std'] = grouped[bat_speed_col].std().fillna(0.0)
 
-    # Contact rate heuristic
     if desc_col in df.columns:
         contact_flags = df[desc_col].fillna('').str.lower().str.contains('contact|foul|hit|ball in play|in play')
-        features['contact_rate'] = grouped[desc_col].apply(lambda s: contact_flags.loc[s.index].mean())
+        try:
+            contact_counts = grouped.apply(lambda s: int(contact_flags.loc[s.index].sum()))
+            total_contacts = contact_counts.sum()
+            p0c = float(total_contacts) / float(total_swings) if total_swings > 0 else 0.0
+            alpha_c = p0c * prior_n
+            beta_c = (1.0 - p0c) * prior_n
+            shrunk_contact = (contact_counts + alpha_c) / (swings_counts + prior_n)
+            features['contact_rate'] = shrunk_contact.fillna(0.0)
+        except Exception:
+            features['contact_rate'] = grouped[desc_col].apply(lambda s: contact_flags.loc[s.index].mean())
 
-    # Fill NaNs and return
+    for col in ['bat_speed', 'swing_length', 'attack_angle', 'swing_path_tilt', 'intercept_ball_minus_batter_pos_x_inches', 'intercept_ball_minus_batter_pos_y_inches']:
+        if col in df.columns:
+            features[col + '_mean'] = grouped[col].mean()
+
+    if 'attack_direction' in df.columns:
+        def circ_mean_deg(s):
+            s = s.dropna()
+            if len(s) == 0:
+                return 0.0
+            r = np.deg2rad(s.values)
+            mean_angle = np.arctan2(np.mean(np.sin(r)), np.mean(np.cos(r)))
+            return np.rad2deg(mean_angle) % 360
+        features['attack_direction_mean'] = grouped['attack_direction'].apply(circ_mean_deg)
+
+    for pcol in ['whiff_rate', 'contact_rate']:
+        if pcol in features.columns:
+            vals = features[pcol].clip(0.0, 1.0).astype(float)
+            features[pcol] = np.arcsin(np.sqrt(vals))
+
     return features.fillna(0.0)
 
 
 def choose_k(X, min_k=2, max_k=10, n_init=10, imbalance_weight=0.0,
              silhouette_tol=0.02, prefer_larger_k=True,
              min_cluster_size=5, min_cluster_frac=0.01):
-    """Pick k via silhouette with tolerance window and (optional) size/imbalance constraints."""
     best_sil = -1e9
     stats = {}
 
@@ -186,7 +181,7 @@ def choose_k(X, min_k=2, max_k=10, n_init=10, imbalance_weight=0.0,
         if sil > best_sil:
             best_sil = sil
 
-    # candidates within tolerance of best silhouette
+    
     candidates = []
     for k, s in stats.items():
         if s['silhouette'] < 0:
@@ -195,16 +190,15 @@ def choose_k(X, min_k=2, max_k=10, n_init=10, imbalance_weight=0.0,
             candidates.append((k, s))
 
     if not candidates:
-        # fall back: pick argmax combined among valid entries
+        
         valid = [(k, s) for k, s in stats.items() if s['combined'] > -1e8]
         if not valid:
-            # as a last resort, pick the max k tried
             fallback_k = max(range(min_k, max_k + 1))
             return fallback_k, -1e9, stats
         best_k = max(valid, key=lambda kv: kv[1]['combined'])[0]
         return best_k, stats[best_k]['combined'], stats
 
-    # within tolerance: either largest k or best combined (sil - imbalance*cv)
+    
     if prefer_larger_k:
         best_k = max(candidates, key=lambda kv: kv[0])[0]
     else:
@@ -238,7 +232,6 @@ def plot_diagnostics(X_pca, labels, scores, outdir: Path):
         plt.close()
 
 
-# ---------------- Main ----------------
 def main():
     args = parse_args()
     inp = Path(args.input)
@@ -247,45 +240,51 @@ def main():
 
     print('Loading data...')
     df = pd.read_csv(inp)
-    for col in [args.launch_speed, args.launch_angle, args.bat_speed]:
+    
+    extra_numeric = [
+        args.launch_speed, args.launch_angle, args.bat_speed,
+        'swing_length', 'attack_angle', 'swing_path_tilt', 'attack_direction',
+        'intercept_ball_minus_batter_pos_x_inches', 'intercept_ball_minus_batter_pos_y_inches'
+    ]
+    for col in extra_numeric:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
     feats = aggregate_features(df, args.player_col, args.description_col,
                                args.launch_speed, args.launch_angle, args.bat_speed)
-
-    # Drop players with few swings
+    
     feats = feats[feats['n_swings'] >= args.min_swings]
     if args.sample_frac < 1.0:
         feats = feats.sample(frac=args.sample_frac, random_state=42)
-
-    # ---- Clean features before scaling ----
     X_df = feats.drop(columns=['n_swings'], errors='ignore')
     X_df = X_df.select_dtypes(include=[np.number])
 
     if args.player_col in X_df.columns:
         X_df = X_df.drop(columns=[args.player_col])
 
-    # Drop near-constant features
+    
+    if 'contact_rate' in X_df.columns:
+        try:
+            
+            if 'whiff_rate' in X_df.columns:
+                X_df['whiff_rate'] = X_df['whiff_rate'] * 0.2
+        except Exception:
+            pass
+        X_df = X_df.drop(columns=['contact_rate'], errors='ignore')
+    
     low_var = X_df.std() < 1e-3
     if low_var.any():
         print("Dropping near-constant features:", list(X_df.columns[low_var]))
         X_df = X_df.loc[:, ~low_var]
-
-    # Drop rows with all-zero core stats
+    
     core_cols = [c for c in ['launch_speed_mean','bat_speed_mean','launch_angle_mean'] if c in X_df.columns]
     if core_cols:
         X_df = X_df[X_df[core_cols].sum(axis=1) != 0]
-
-    # Drop NaN rows
+    
     X_df = X_df.dropna()
-
-    # ---- Winsorize / clip outliers to 1st-99th percentiles ----
     for col in X_df.columns:
         lo, hi = X_df[col].quantile([0.01, 0.99])
         X_df[col] = X_df[col].clip(lo, hi)
-
-    # ---- Drop highly correlated features (> 0.92) ----
     corr = X_df.corr().abs()
     to_drop = set()
     cols = list(corr.columns)
@@ -299,9 +298,23 @@ def main():
     if to_drop:
         print("Dropping highly correlated:", sorted(to_drop))
         X_df = X_df.drop(columns=sorted(to_drop))
-
-    # ---- Standardize ----
-    scaler = StandardScaler()
+    mad = X_df.apply(lambda x: (x - x.median()).abs().median())
+    
+    stds = X_df.std()
+    mad2 = mad.copy()
+    for c in mad2.index:
+        if mad2[c] == 0 or pd.isna(mad2[c]):
+            if stds[c] > 0:
+                mad2[c] = stds[c]
+            else:
+                mad2[c] = 1.0
+    k_mad = 5.0
+    med = X_df.median()
+    for col in X_df.columns:
+        lo = med[col] - k_mad * mad2[col]
+        hi = med[col] + k_mad * mad2[col]
+        X_df[col] = X_df[col].clip(lo, hi)
+    scaler = RobustScaler()
     X = scaler.fit_transform(X_df.values)
 
     # ---- PCA ----
@@ -361,6 +374,11 @@ def main():
         json.dump({'params': params, 'diagnostics': diagnostics}, fh, indent=2)
 
     result = feats.loc[X_df.index].copy()
+    out_feats = []
+    if 'n_swings' in result.columns:
+        out_feats.append('n_swings')
+    out_feats += [c for c in X_df.columns if c in result.columns]
+    result = result[out_feats]
     result['cluster'] = labels
     result.reset_index(inplace=True)
     result = result.rename(columns={'index': args.player_col})
@@ -371,7 +389,6 @@ def main():
     print(f"Wrote clusters for {len(result)} players to {out_csv}")
     print(f"Plots written to {outdir}")
 
-    # ---- Post-run summaries: centroids (inverse-transformed), sizes, and top diffs ----
     try:
         centroids = pd.DataFrame(
             scaler.inverse_transform(km.cluster_centers_), columns=X_df.columns

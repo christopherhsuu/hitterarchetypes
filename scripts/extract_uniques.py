@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-Read a swings CSV, extract unique values from 'batter' and 'pitcher' columns,
-and write them to two CSV files.
-
-Usage:
-  python scripts/extract_uniques.py \
-      --input data/2025_swings.csv \
-      --batters-out data/unique_batters.csv \
-      --pitchers-out data/unique_pitchers.csv
-"""
 import argparse
 import csv
 from pathlib import Path
@@ -43,18 +33,16 @@ def extract_uniques(input_path, batters_out, pitchers_out):
             raise ValueError("Could not find a 'pitcher' column in input CSV headers: " + str(reader.fieldnames))
 
         for row in reader:
-            # Use raw values; caller can normalize if needed
             b = row.get(batter_col)
             p = row.get(pitcher_col)
-            if b is not None and b != '':
+            if b:
                 batters.add(b)
-            if p is not None and p != '':
+            if p:
                 pitchers.add(p)
 
     batters = sorted(batters)
     pitchers = sorted(pitchers)
 
-    # Ensure output directory exists
     Path(batters_out).parent.mkdir(parents=True, exist_ok=True)
     Path(pitchers_out).parent.mkdir(parents=True, exist_ok=True)
 
