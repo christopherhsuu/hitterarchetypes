@@ -1,139 +1,21 @@
 {
   "params": {
-    "min_k": 2,
-    "max_k": 10,
-    "forced_k": null,
-    "min_swings": 5,
+    "min_k": 3,
+    "max_k": 8,
+    "forced_k": 5,
+    "min_swings": 15,
     "features": [
-      "whiff_rate",
       "launch_speed_mean",
       "launch_speed_std",
+      "launch_speed_median",
+      "launch_speed_p95",
+      "pct_hard_hit",
       "launch_angle_mean",
       "launch_angle_std",
-      "bat_speed_mean",
-      "bat_speed_std",
-      "contact_rate"
+      "launch_angle"
     ],
     "n_init": 10,
-    "imbalance_weight": 0.0
+    "imbalance_weight": 0.5
   },
-  "diagnostics": {
-    "2": {
-      "silhouette": 0.901353740968402,
-      "imbalance": 0.9945504087193461,
-      "combined": 0.901353740968402,
-      "counts": [
-        732.0,
-        2.0
-      ]
-    },
-    "3": {
-      "silhouette": 0.6526339862306941,
-      "imbalance": 1.2943840484245714,
-      "combined": 0.6526339862306941,
-      "counts": [
-        692.0,
-        40.0,
-        2.0
-      ]
-    },
-    "4": {
-      "silhouette": 0.3868097949423756,
-      "imbalance": 1.204436729259688,
-      "combined": 0.3868097949423756,
-      "counts": [
-        40.0,
-        2.0,
-        557.0,
-        135.0
-      ]
-    },
-    "5": {
-      "silhouette": 0.39986721565489364,
-      "imbalance": 1.4409725650902372,
-      "combined": 0.39986721565489364,
-      "counts": [
-        133.0,
-        36.0,
-        559.0,
-        2.0,
-        4.0
-      ]
-    },
-    "6": {
-      "silhouette": 0.19943577109541538,
-      "imbalance": 1.01377412383028,
-      "combined": 0.19943577109541538,
-      "counts": [
-        114.0,
-        270.0,
-        4.0,
-        2.0,
-        308.0,
-        36.0
-      ]
-    },
-    "7": {
-      "silhouette": 0.20632248204243875,
-      "imbalance": 1.0740085410436264,
-      "combined": 0.20632248204243875,
-      "counts": [
-        279.0,
-        2.0,
-        4.0,
-        35.0,
-        272.0,
-        107.0,
-        35.0
-      ]
-    },
-    "8": {
-      "silhouette": 0.21032605494119921,
-      "imbalance": 1.2029255273132322,
-      "combined": 0.21032605494119921,
-      "counts": [
-        14.0,
-        31.0,
-        283.0,
-        2.0,
-        4.0,
-        32.0,
-        98.0,
-        270.0
-      ]
-    },
-    "9": {
-      "silhouette": 0.22607358257770518,
-      "imbalance": 1.2821169682561913,
-      "combined": 0.22607358257770518,
-      "counts": [
-        35.0,
-        2.0,
-        311.0,
-        4.0,
-        32.0,
-        3.0,
-        134.0,
-        203.0,
-        10.0
-      ]
-    },
-    "10": {
-      "silhouette": 0.21595900352834932,
-      "imbalance": 1.290431686410628,
-      "combined": 0.21595900352834932,
-      "counts": [
-        122.0,
-        221.0,
-        2.0,
-        18.0,
-        4.0,
-        278.0,
-        16.0,
-        19.0,
-        18.0,
-        36.0
-      ]
-    }
-  }
+  "diagnostics": {}
 }

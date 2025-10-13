@@ -1,0 +1,134 @@
+Cluster parameters and preprocessing — hitterarchetypes
+Generated: 2025-10-13
+
+Overview
+--------
+This project aggregates per-swing Statcast features for each batter, derives several
+per-player statistics (exit velocity, angles, whiff/contact heuristics), and then
+clusters batters into archetypes using KMeans. The clustering pipeline includes
+preprocessing steps and an automatic k-selection routine driven by silhouette score
+with optional imbalance penalties. The file below records the exact parameters and
+thresholds used in the last run (and the default values in the script).
+
+Files of interest
+-----------------
+- Input swings CSV used (default): data/raw/2025_swings.csv
+- Per-player aggregated output: data/player_archetypes.csv
+- Diagnostics (params + per-k scores): out/cluster_plots/diagnostics.json
+- Human-friendly cluster summary: out/cluster_explanation.txt
+- Per-cluster CSVs: data/clusters/cluster_<label>.csv
+
+Exact parameters / thresholds used (defaults shown below)
+-------------------------------------------------------
+- Input player id column: 'batter' (script default: --player-col batter)
+- Numeric column names (defaults):
+    launch_speed column: 'launch_speed' (--launch-speed)
+    launch_angle column: 'launch_angle' (--launch-angle)
+    bat_speed column: 'bat_speed' (--bat-speed)
+    description column: 'description' (--description-col)
+
+- Aggregation thresholds:
+    min_swings (players with fewer swings are dropped): 5  (--min-swings)
+    sample_frac (fraction of players sampled for quick runs): 1.0 (--sample-frac)
+
+- Feature engineering (per-player features computed if the raw columns exist):
+    - whiff_rate (robust heuristic from description/events/type)
+      * If whiff_rate is all zero, a fallback 'miss' heuristic is used.
+      * Note: whiff_rate often had near-zero variance in this dataset and was dropped.
+    - contact_rate (heuristic from description text)
+    - launch_speed_mean, launch_speed_std, launch_speed_median, launch_speed_p95
+    - pct_hard_hit (fraction of launch_speed >= 95 mph)
+    - launch_angle_mean, launch_angle_std
+    - bat_speed_mean, bat_speed_std
+
+- Pre-clustering cleaning:
+    - Convert candidate columns to numeric with coercion (non-numeric -> NaN).
+    - Drop near-constant features: any feature with std < 1e-3 is removed.
+    - Drop rows where all core stats are zero (core stats = intersection of ['launch_speed_mean','bat_speed_mean','launch_angle_mean'] that exist).
+    - Drop rows with NaNs after the above.
+
+- k-selection (automatic) and KMeans parameters:
+    - Search k from min_k to max_k: min_k=2, max_k=10  (--min-k, --max-k)
+    - KMeans n_init: 10  (--n-init)
+    - Imbalance penalty weight: 0.0 (no penalty)  (--imbalance-weight)
+        * combined_score = silhouette - imbalance_weight * (CV of cluster sizes)
+    - silhouette_tol = 0.02 (accept ks with silhouette >= best - tol)  (--silhouette-tol)
+    - prefer_larger_k = True (when multiple ks within tol, pick the largest)  (--prefer-larger-k)
+    - min_cluster_size = 5 (reject k if any cluster has fewer than this many players)  (--min-cluster-size)
+    - min_cluster_frac = 0.01 (reject k if any cluster has fewer than this fraction of players)  (--min-cluster-frac)
+
+- Near-constant feature removal threshold: std < 1e-3
+
+What the last run produced
+-------------------------
+The last completed run wrote these values into out/cluster_plots/diagnostics.json (params section):
+
+  min_k: 2
+  max_k: 10
+  forced_k: null (no forced k)
+  min_swings: 5
+  features used for clustering (auto-detected numeric after cleaning):
+    ['launch_speed_mean', 'launch_speed_std', 'launch_speed_median',
+     'launch_speed_p95', 'pct_hard_hit',
+     'launch_angle_mean', 'launch_angle_std',
+     'bat_speed_mean', 'bat_speed_std']
+  n_init: 10
+  imbalance_weight: 0.0
+
+Per-k diagnostics (excerpt from diagnostics.json):
+  k=2 -> silhouette: 0.31217, imbalance (CV): 0.38356, counts: [225, 505]
+  k=3 -> silhouette: 0.31474, imbalance (CV): 0.78196, counts: [495, 200, 35]
+  k=4 -> silhouette: 0.20703, counts: [291, 33, 310, 96]
+  k=5 -> silhouette: 0.21352, counts: [303, 118, 263, 13, 33]
+  k>=6 -> rejected due to min_cluster_size/min_cluster_frac constraints in this run
+
+Final chosen clustering (what was written to data/player_archetypes.csv):
+  - Chosen k: 3 (automatic selection favored k=3 given silhouette and tolerance rules)
+  - Final cluster counts (cluster labels in data/player_archetypes.csv):
+      cluster 0: 495 players
+      cluster 1: 200 players
+      cluster 2: 35 players
+
+Why clusters are uneven
+-----------------------
+- A few factors drive imbalance:
+  1) Data density: most batters have similar aggregated stat profiles, forming a large dense cluster.
+  2) Silhouette optimization (with imbalance_weight=0) prefers high average cohesion/separation and may favor separating a few distinct players into small clusters while keeping a large main cluster.
+  3) Some players have near-zero or missing aggregated stats and get grouped into tiny, degenerate clusters.
+  4) Some highly informative features (like whiff_rate and contact_rate) had near-zero variance and were automatically removed, reducing clustering signal variety.
+
+Why whiff_rate was all zeros or dropped
+--------------------------------------
+- We implemented a robust whiff detection combining 'description', 'events', and 'type'. However, in your swings CSV the descriptions/events appear either not present, too sparse, or uniformly formatted so that the derived whiff/miss flags had extremely low variance across players.
+- Since the script drops near-constant features (std < 1e-3), whiff_rate and contact_rate were removed before clustering. This is why you saw all zeros earlier.
+
+Recommendations to get more even and meaningful clusters
+------------------------------------------------------
+1) Increase feature diversity
+   - Add more Statcast columns if available: spin_rate, release_speed, plate_x, plate_z, zone, launch_spin, effective_speed, or per-zone metrics. These often vary by batter type.
+2) Include rate-based features with more variance
+   - If whiff/miss data aren't present, consider using swing% / swing-strike% from pitch-level data or contact% from pitch-by-pitch type columns.
+3) Adjust cluster selection tuning
+   - Use --imbalance-weight > 0 (e.g., 0.3–1.0) to penalize imbalanced clusterings during automatic k selection.
+   - Increase silhouette_tol (e.g., 0.03–0.05) so you can prefer a more balanced k within the quality tolerance.
+4) Filter noisy players
+   - Raise --min-swings (e.g., to 10 or 20) to exclude players with too few swings and noisy aggregates.
+5) Try alternative clustering algorithms
+   - Gaussian Mixture Models (GMM) with priors, Agglomerative clustering with a min-cluster constraint, or spectral clustering may distribute players more evenly.
+6) Force k and iterate
+   - Force a target k (e.g., --k 5) and then inspect cluster sizes; use --min-cluster-size to disallow tiny clusters.
+
+Commands/examples
+-----------------
+Force k=5 and keep plots separate:
+  python3 scripts/cluster_archetypes.py --k 5 --plots out/cluster_plots_k5
+
+Penalize imbalance (example):
+  python3 scripts/cluster_archetypes.py --imbalance-weight 0.5 --plots out/cluster_plots_imb0.5
+
+Require more swings (example):
+  python3 scripts/cluster_archetypes.py --min-swings 10 --plots out/cluster_plots_min10
+
+If you want, I can re-run the pipeline with one of these options and attach the new counts + plots.
+
+-- End of file

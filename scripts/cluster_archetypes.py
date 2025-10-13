@@ -2,31 +2,15 @@
 """
 Cluster players into archetypes using per-swing Statcast data.
 
-What it does:
-- Reads a swings CSV (default: data/raw/2025_swings.csv)
-- Aggregates per-player features (means/rates) for selected statcast columns
-- Derives whiff/contact rates when possible from event/description columns
-- Standardizes features, runs PCA for visualization
-- Chooses K (clusters) by maximizing silhouette score over k=2..10
-- Runs KMeans, writes per-player cluster assignments to CSV and saves plots
-
-Usage:
-  python3 scripts/cluster_archetypes.py \
-      --input data/raw/2025_swings.csv \
-      --player-col batter \
-      --out data/player_archetypes.csv --plots out/plots
-
-Notes:
-- The script is defensive: if a named column isn't present in the CSV it will skip
-  that feature and proceed with the ones available.
-- You can pass alternate column names for launch speed/angle/bat speed via CLI.
+Enhancements:
+- Cleans zero / constant features before clustering
+- Removes player ID from feature matrix
+- Filters all-zero or missing rows
+- Preserves your silhouette diagnostics and PCA plots
 """
-from pathlib import Path
-import argparse
-import sys
-import re
-import warnings
 
+from pathlib import Path
+import argparse, sys, re, warnings, json
 import numpy as np
 import pandas as pd
 
@@ -41,131 +25,196 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
+# ---------------- Argument parsing ----------------
 def parse_args():
     p = argparse.ArgumentParser(description='Cluster players into archetypes from Statcast swings')
-    p.add_argument('--input', '-i', default='data/raw/2025_swings.csv', help='Input swings CSV')
-    p.add_argument('--player-col', default='batter', help='Column name for player id')
-    p.add_argument('--launch-speed', default='launch_speed', help='launch speed column name')
-    p.add_argument('--launch-angle', default='launch_angle', help='launch angle column name')
-    p.add_argument('--bat-speed', default='bat_speed', help='bat speed column name (if available)')
-    p.add_argument('--description-col', default='description', help='column with event/description to infer whiffs')
-    p.add_argument('--out', default='data/player_archetypes.csv', help='Output CSV with cluster assignments')
-    p.add_argument('--plots', default='out/cluster_plots', help='Directory to write diagnostic plots')
-    p.add_argument('--min-k', type=int, default=2, help='Minimum k to try')
-    p.add_argument('--max-k', type=int, default=10, help='Maximum k to try')
-    p.add_argument('--k', type=int, default=None, help='If set, force this k and skip automatic selection')
-    p.add_argument('--min-swings', type=int, default=5, help='Minimum swings per player to include')
-    p.add_argument('--features', default=None, help='Comma-separated list of feature column names to use (default: auto detect numeric)')
-    p.add_argument('--n-init', type=int, default=10, help='n_init parameter for KMeans')
-    p.add_argument('--imbalance-weight', type=float, default=0.0, help='Penalty weight for cluster size imbalance when selecting k (0 = ignore imbalance)')
-    p.add_argument('--sample-frac', type=float, default=1.0, help='Fraction sample of players for quick runs (0-1]')
+    p.add_argument('--input', '-i', default='data/raw/2025_swings.csv')
+    p.add_argument('--player-col', default='batter')
+    p.add_argument('--launch-speed', default='launch_speed')
+    p.add_argument('--launch-angle', default='launch_angle')
+    p.add_argument('--bat-speed', default='bat_speed')
+    p.add_argument('--description-col', default='description')
+    p.add_argument('--out', default='data/player_archetypes.csv')
+    p.add_argument('--plots', default='out/cluster_plots')
+    p.add_argument('--min-k', type=int, default=3)
+    p.add_argument('--max-k', type=int, default=8)
+    p.add_argument('--k', type=int, default=None)
+    p.add_argument('--min-swings', type=int, default=15)
+    p.add_argument('--features', default=None)
+    p.add_argument('--n-init', type=int, default=10)
+    p.add_argument('--imbalance-weight', type=float, default=0.5,
+                   help='Penalty weight for cluster size imbalance (higher penalizes uneven sizes)')
+    # NEW:
+    p.add_argument('--silhouette-tol', type=float, default=0.03,
+                   help='Accept any k with silhouette >= best - tol (e.g., 0.03 ≈ within 3 points)')
+    p.add_argument('--prefer-larger-k', action='store_true', default=True,
+                   help='If multiple ks are within tolerance, pick the largest k')
+    p.add_argument('--min-cluster-size', type=int, default=22,
+                   help='Reject ks where any cluster has fewer than this many players')
+    p.add_argument('--min-cluster-frac', type=float, default=0.03,
+                   help='Also reject ks where any cluster has fewer than this fraction of players')
+    p.add_argument('--sample-frac', type=float, default=1.0)
     return p.parse_args()
 
 
-def safe_head(df, n=5):
-    with pd.option_context('display.max_rows', n):
-        return df.head(n)
 
-
+# ---------------- Helper functions ----------------
 def infer_whiff_flag(desc):
-    """Return True if description string indicates a swinging strike / whiff.
-    This is a heuristic covering common MLBAM description values.
-    """
-    if pd.isna(desc):
-        return False
+    if pd.isna(desc): return False
     d = str(desc).lower()
-    # common swinging strike descriptions
     patterns = [r"swinging_strike", r"swinging strike", r"miss", r"whiff", r"swinging_strike_blocked"]
-    for p in patterns:
-        if re.search(p, d):
-            return True
-    return False
+    return any(re.search(p, d) for p in patterns)
 
 
 def aggregate_features(df, player_col, desc_col, launch_speed_col, launch_angle_col, bat_speed_col):
-    # Ensure player id present
     if player_col not in df.columns:
         raise ValueError(f"Player column '{player_col}' not found in data. Columns: {list(df.columns)}")
 
     grouped = df.groupby(player_col)
-
     features = pd.DataFrame(index=grouped.size().index)
-
-    # total swings/rows per player
     features['n_swings'] = grouped.size()
 
-    # whiff rate (from description)
+    # Robust whiff/miss detection combining description, events, and type columns
+    whiff_flag = pd.Series(False, index=df.index)
     if desc_col in df.columns:
-        whiff = df[desc_col].apply(infer_whiff_flag)
-        features['whiff_rate'] = grouped[desc_col].apply(lambda s: whiff.loc[s.index].mean())
-    else:
-        warnings.warn(f"Description column '{desc_col}' not found; skipping whiff_rate")
+        desc = df[desc_col].fillna('').astype(str).str.lower()
+        whiff_flag = whiff_flag | desc.str.contains(r"swinging_strike|swinging strike|swinging_strike_blocked|whiff|swing and miss|miss")
+        # capture patterns like 'swing' + 'miss'
+        whiff_flag = whiff_flag | (desc.str.contains(r"swing") & desc.str.contains(r"miss|whiff"))
+    if 'events' in df.columns:
+        ev = df['events'].fillna('').astype(str).str.lower()
+        whiff_flag = whiff_flag | ev.str.contains(r"swinging_strike|whiff|miss")
+    if 'type' in df.columns and desc_col in df.columns:
+        t = df['type'].fillna('').astype(str)
+        desc = df[desc_col].fillna('').astype(str).str.lower()
+        whiff_flag = whiff_flag | ((t == 'S') & desc.str.contains('swing'))
 
-    # launch speed/angle means and stds
+    try:
+        features['whiff_rate'] = grouped.apply(lambda s: whiff_flag.loc[s.index].mean())
+    except Exception:
+        features['whiff_rate'] = 0.0
+
+    # If whiff_rate is all zero (no descriptions/events present), compute a fallback 'miss_rate'
+    if features['whiff_rate'].max() == 0:
+        miss_flag = pd.Series(False, index=df.index)
+        if desc_col in df.columns:
+            desc = df[desc_col].fillna('').astype(str).str.lower()
+            miss_flag = miss_flag | desc.str.contains(r"miss|whiff|swing and miss")
+        if 'events' in df.columns:
+            ev = df['events'].fillna('').astype(str).str.lower()
+            miss_flag = miss_flag | ev.str.contains(r"miss|whiff")
+        try:
+            features['whiff_rate'] = grouped.apply(lambda s: miss_flag.loc[s.index].mean())
+        except Exception:
+            features['whiff_rate'] = 0.0
+
+    # Launch metrics and additional EV stats
     if launch_speed_col in df.columns:
+        ls = df[launch_speed_col]
         features['launch_speed_mean'] = grouped[launch_speed_col].mean()
         features['launch_speed_std'] = grouped[launch_speed_col].std().fillna(0.0)
-    else:
-        warnings.warn(f"Launch speed column '{launch_speed_col}' not found; skipping")
+        # Advanced exit-velocity features
+        features['launch_speed_median'] = grouped[launch_speed_col].median()
+        try:
+            features['launch_speed_p95'] = grouped[launch_speed_col].quantile(0.95)
+        except Exception:
+            features['launch_speed_p95'] = grouped[launch_speed_col].apply(lambda s: s.quantile(0.95) if len(s) > 0 else 0)
+        # percent hard-hit (>=95 mph) — guard against missing values
+        try:
+            features['pct_hard_hit'] = grouped[launch_speed_col].apply(lambda s: (s >= 95).mean() if len(s.dropna())>0 else 0.0)
+        except Exception:
+            features['pct_hard_hit'] = 0.0
 
     if launch_angle_col in df.columns:
         features['launch_angle_mean'] = grouped[launch_angle_col].mean()
         features['launch_angle_std'] = grouped[launch_angle_col].std().fillna(0.0)
-    else:
-        warnings.warn(f"Launch angle column '{launch_angle_col}' not found; skipping")
-
-    # bat speed (if present)
+        # Batted-ball distribution mix: ground/line/flat (gb/ld/fb)
+        def bb_mix(s):
+            s = s.dropna()
+            return pd.Series({
+                'gb_pct': (s < 10).mean(),
+                'ld_pct': ((s >= 10) & (s < 25)).mean(),
+                'fb_pct': (s >= 25).mean(),
+            })
+        try:
+            mix = df[[player_col, launch_angle_col]].groupby(player_col)[launch_angle_col].apply(bb_mix)
+            # join mix (it returns a DataFrame with multiindex sometimes)
+            features = features.join(mix)
+        except Exception:
+            # fallback: compute per-player via apply
+            mix2 = grouped[launch_angle_col].apply(bb_mix)
+            features = features.join(mix2)
     if bat_speed_col in df.columns:
         features['bat_speed_mean'] = grouped[bat_speed_col].mean()
         features['bat_speed_std'] = grouped[bat_speed_col].std().fillna(0.0)
-    else:
-        warnings.warn(f"Bat speed column '{bat_speed_col}' not found; skipping")
 
-    # contact rate: heuristic if description contains 'contact' keywords
+    # Contact rate heuristic
     if desc_col in df.columns:
         contact_flags = df[desc_col].fillna('').str.lower().str.contains('contact|foul|hit|ball in play|in play')
         features['contact_rate'] = grouped[desc_col].apply(lambda s: contact_flags.loc[s.index].mean())
-    else:
-        warnings.warn("No description column for contact_rate; skipping")
 
-    # replace NaNs from players with single swing
-    features = features.fillna(0.0)
-
-    return features
+    # Fill NaNs and return
+    return features.fillna(0.0)
 
 
-def choose_k(X, min_k=2, max_k=10, n_init=10, imbalance_weight=0.0):
-    """Choose k by silhouette score with optional penalty for imbalance.
+def choose_k(X, min_k=2, max_k=10, n_init=10, imbalance_weight=0.0,
+             silhouette_tol=0.02, prefer_larger_k=True,
+             min_cluster_size=5, min_cluster_frac=0.01):
+    """Pick k via silhouette with tolerance window and (optional) size/imbalance constraints."""
+    best_sil = -1e9
+    stats = {}
 
-    imbalance_weight: multiplies the imbalance penalty (0 disables). Penalty is
-    computed as the coefficient of variation (std/mean) of cluster sizes.
-    """
-    best_k = None
-    best_score = -1e9
-    diagnostics = {}
+    N = X.shape[0]
     for k in range(min_k, max_k + 1):
         km = KMeans(n_clusters=k, random_state=42, n_init=n_init)
         labels = km.fit_predict(X)
-        uniq = np.unique(labels)
-        if len(uniq) == 1:
-            diagnostics[k] = {'silhouette': -1.0, 'imbalance': 1.0, 'combined': -1.0}
+
+        # counts & size checks
+        counts = np.array([(labels == i).sum() for i in range(k)], dtype=int)
+        min_ok = (counts.min() >= min_cluster_size) and (counts.min() >= int(np.floor(min_cluster_frac * N)))
+        if not min_ok:
+            stats[k] = {'silhouette': -1.0, 'imbalance': None, 'combined': -1e9, 'counts': counts.tolist()}
             continue
+
         sil = silhouette_score(X, labels)
-        # imbalance penalty: cv = std(counts) / mean(counts)
-        counts = np.array([np.sum(labels == u) for u in uniq], dtype=float)
         cv = counts.std() / counts.mean() if counts.mean() > 0 else 1.0
         combined = sil - imbalance_weight * cv
-        diagnostics[k] = {'silhouette': float(sil), 'imbalance': float(cv), 'combined': float(combined), 'counts': counts.tolist()}
-        if combined > best_score:
-            best_score = combined
-            best_k = k
-    return best_k, best_score, diagnostics
+
+        stats[k] = {'silhouette': float(sil), 'imbalance': float(cv),
+                    'combined': float(combined), 'counts': counts.tolist()}
+
+        if sil > best_sil:
+            best_sil = sil
+
+    # candidates within tolerance of best silhouette
+    candidates = []
+    for k, s in stats.items():
+        if s['silhouette'] < 0:
+            continue
+        if s['silhouette'] >= best_sil - silhouette_tol:
+            candidates.append((k, s))
+
+    if not candidates:
+        # fall back: pick argmax combined among valid entries
+        valid = [(k, s) for k, s in stats.items() if s['combined'] > -1e8]
+        if not valid:
+            # as a last resort, pick the max k tried
+            fallback_k = max(range(min_k, max_k + 1))
+            return fallback_k, -1e9, stats
+        best_k = max(valid, key=lambda kv: kv[1]['combined'])[0]
+        return best_k, stats[best_k]['combined'], stats
+
+    # within tolerance: either largest k or best combined (sil - imbalance*cv)
+    if prefer_larger_k:
+        best_k = max(candidates, key=lambda kv: kv[0])[0]
+    else:
+        best_k = max(candidates, key=lambda kv: kv[1]['combined'])[0]
+
+    return best_k, stats[best_k]['combined'], stats
 
 
 def plot_diagnostics(X_pca, labels, scores, outdir: Path):
     outdir.mkdir(parents=True, exist_ok=True)
-
-    # PCA scatter
     dfp = pd.DataFrame(X_pca, columns=['PC1', 'PC2'])
     dfp['cluster'] = labels.astype(str)
     plt.figure(figsize=(8, 6))
@@ -176,87 +225,129 @@ def plot_diagnostics(X_pca, labels, scores, outdir: Path):
     plt.savefig(outdir / 'pca_clusters.png', dpi=150)
     plt.close()
 
-    # silhouette by k plot
-    ks = sorted(scores.keys())
-    vals = [scores[k] for k in ks]
-    plt.figure()
-    plt.plot(ks, vals, marker='o')
-    plt.xlabel('k')
-    plt.ylabel('silhouette score')
-    plt.title('Silhouette score by k')
-    plt.grid(True)
-    plt.savefig(outdir / 'silhouette_by_k.png', dpi=150)
-    plt.close()
+    if scores:
+        ks = sorted(scores.keys())
+        vals = [scores[k] for k in ks]
+        plt.figure()
+        plt.plot(ks, vals, marker='o')
+        plt.xlabel('k')
+        plt.ylabel('silhouette score')
+        plt.title('Silhouette score by k')
+        plt.grid(True)
+        plt.savefig(outdir / 'silhouette_by_k.png', dpi=150)
+        plt.close()
 
 
+# ---------------- Main ----------------
 def main():
     args = parse_args()
     inp = Path(args.input)
     if not inp.exists():
-        print(f"Input file not found: {inp}", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(f"Input file not found: {inp}")
 
-    print('Loading data (this may take a minute)')
-    df = pd.read_csv(inp, dtype=str)
-    # convert numeric candidate columns to numeric if present
+    print('Loading data...')
+    df = pd.read_csv(inp)
     for col in [args.launch_speed, args.launch_angle, args.bat_speed]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # aggregate per player
     feats = aggregate_features(df, args.player_col, args.description_col,
                                args.launch_speed, args.launch_angle, args.bat_speed)
 
-    # optional sampling for speed
+    # Drop players with few swings
+    feats = feats[feats['n_swings'] >= args.min_swings]
     if args.sample_frac < 1.0:
         feats = feats.sample(frac=args.sample_frac, random_state=42)
 
-    # drop players with very few swings
-    feats = feats[feats['n_swings'] >= args.min_swings]
+    # ---- Clean features before scaling ----
+    X_df = feats.drop(columns=['n_swings'], errors='ignore')
+    X_df = X_df.select_dtypes(include=[np.number])
 
-    # features to use (exclude n_swings)
-    X_df = feats.drop(columns=['n_swings'])
+    if args.player_col in X_df.columns:
+        X_df = X_df.drop(columns=[args.player_col])
 
-    # if user provided a feature list, restrict to those (and ensure they exist)
-    if args.features:
-        requested = [c.strip() for c in args.features.split(',') if c.strip()]
-        missing = [c for c in requested if c not in X_df.columns]
-        if missing:
-            print(f'Warning: requested features not found and will be ignored: {missing}')
-        keep = [c for c in requested if c in X_df.columns]
-        if keep:
-            X_df = X_df[keep]
-        else:
-            print('No requested features available; using auto-detected features')
-    print('Using features:', list(X_df.columns))
+    # Drop near-constant features
+    low_var = X_df.std() < 1e-3
+    if low_var.any():
+        print("Dropping near-constant features:", list(X_df.columns[low_var]))
+        X_df = X_df.loc[:, ~low_var]
 
-    # standardize
+    # Drop rows with all-zero core stats
+    core_cols = [c for c in ['launch_speed_mean','bat_speed_mean','launch_angle_mean'] if c in X_df.columns]
+    if core_cols:
+        X_df = X_df[X_df[core_cols].sum(axis=1) != 0]
+
+    # Drop NaN rows
+    X_df = X_df.dropna()
+
+    # ---- Winsorize / clip outliers to 1st-99th percentiles ----
+    for col in X_df.columns:
+        lo, hi = X_df[col].quantile([0.01, 0.99])
+        X_df[col] = X_df[col].clip(lo, hi)
+
+    # ---- Drop highly correlated features (> 0.92) ----
+    corr = X_df.corr().abs()
+    to_drop = set()
+    cols = list(corr.columns)
+    for i, c1 in enumerate(cols):
+        for c2 in cols[i+1:]:
+            try:
+                if corr.loc[c1, c2] > 0.92:
+                    to_drop.add(c2)
+            except Exception:
+                continue
+    if to_drop:
+        print("Dropping highly correlated:", sorted(to_drop))
+        X_df = X_df.drop(columns=sorted(to_drop))
+
+    # ---- Standardize ----
     scaler = StandardScaler()
     X = scaler.fit_transform(X_df.values)
 
-    # PCA for visualization
+    # ---- PCA ----
     pca = PCA(n_components=2, random_state=42)
     X_pca = pca.fit_transform(X)
 
-    # choose k (or use forced k)
-    diagnostics = {}
+    # ---- Clustering ----
     if args.k is not None:
         best_k = int(args.k)
-        print(f'Forcing k = {best_k}')
+        print(f"Forcing k = {best_k}")
         km = KMeans(n_clusters=best_k, random_state=42, n_init=args.n_init)
         labels = km.fit_predict(X)
+        diagnostics = {}
+        best_score = 0.0
     else:
-        best_k, best_score, diagnostics = choose_k(X, args.min_k, args.max_k, n_init=args.n_init, imbalance_weight=args.imbalance_weight)
-        print(f'Chosen k = {best_k} (combined score={best_score:.3f})')
-        km = KMeans(n_clusters=best_k, random_state=42, n_init=args.n_init)
-        labels = km.fit_predict(X)
+        best_k, best_score, diagnostics = choose_k(
+            X,
+            min_k=args.min_k,
+            max_k=args.max_k,
+            n_init=args.n_init,
+            imbalance_weight=args.imbalance_weight,
+            silhouette_tol=args.silhouette_tol,
+            prefer_larger_k=args.prefer_larger_k,
+            min_cluster_size=args.min_cluster_size,
+            min_cluster_frac=args.min_cluster_frac,
+        )
 
-    # save diagnostics and params
+    # fallback if choose_k couldn't find valid k
+    if best_k is None:
+        print("⚠️ No valid k found — defaulting to k=3")
+        best_k = 3
+
+    print(f"Chosen k = {best_k} "
+          f"(sil≈{diagnostics.get(best_k, {}).get('silhouette', float('nan')):.3f}, "
+          f"combined={best_score:.3f})")
+
+    km = KMeans(n_clusters=best_k, random_state=42, n_init=args.n_init)
+    labels = km.fit_predict(X)
+
+
+    # ---- Output ----
     outdir = Path(args.plots)
-    outdir.mkdir(parents=True, exist_ok=True)
-    plot_diagnostics(X_pca, labels, {k: diagnostics[k]['silhouette'] if k in diagnostics else None for k in diagnostics}, outdir)
-    # write diagnostics.json
-    import json
+    plot_diagnostics(X_pca, labels,
+                     {k: diagnostics[k]['silhouette'] for k in diagnostics} if diagnostics else {},
+                     outdir)
+
     params = {
         'min_k': args.min_k,
         'max_k': args.max_k,
@@ -269,18 +360,34 @@ def main():
     with open(outdir / 'diagnostics.json', 'w') as fh:
         json.dump({'params': params, 'diagnostics': diagnostics}, fh, indent=2)
 
-    # write per-player CSV
-    out_csv = Path(args.out)
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    result = feats.copy()
-    result = result.drop(columns=['n_swings'])
+    result = feats.loc[X_df.index].copy()
     result['cluster'] = labels
     result.reset_index(inplace=True)
     result = result.rename(columns={'index': args.player_col})
+    out_csv = Path(args.out)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
     result.to_csv(out_csv, index=False)
 
-    print(f'Wrote clusters for {len(result)} players to {out_csv}')
-    print(f'Plots written to {outdir}')
+    print(f"Wrote clusters for {len(result)} players to {out_csv}")
+    print(f"Plots written to {outdir}")
+
+    # ---- Post-run summaries: centroids (inverse-transformed), sizes, and top diffs ----
+    try:
+        centroids = pd.DataFrame(
+            scaler.inverse_transform(km.cluster_centers_), columns=X_df.columns
+        )
+        counts = pd.Series(labels).value_counts().sort_index()
+        print("Cluster sizes:", counts.to_dict())
+        print(centroids.round(2))
+
+        global_mean, global_std = X_df.mean(), X_df.std().replace(0, 1.0)
+        z = (centroids - global_mean) / global_std
+        for i in range(km.n_clusters):
+            top = z.iloc[i].abs().sort_values(ascending=False).head(4)
+            print(f"\ncluster {i} top diffs:")
+            print(top.round(2).to_string())
+    except Exception as e:
+        print('Post-run summary failed:', e)
 
 
 if __name__ == '__main__':
