@@ -161,6 +161,19 @@ def cluster_representatives(df, cluster_label, features_list, n_closest=3, n_far
 def load_player_archetypes(path='data/player_archetypes.csv'):
     p = Path(path)
     if not p.exists():
+        # Diagnostics to help deployed environments: print working dir and data folder contents
+        try:
+            print('DEBUG: load_player_archetypes - cwd=', Path.cwd())
+            print('DEBUG: checking path ->', p, 'resolved ->', p.resolve())
+            data_dir = Path('data')
+            if data_dir.exists():
+                print('DEBUG: data/ directory listing:')
+                for f in sorted([str(x) for x in data_dir.iterdir()] )[:200]:
+                    print('DEBUG:  ', f)
+            else:
+                print('DEBUG: data/ directory does not exist')
+        except Exception as _:
+            print('DEBUG: diagnostics failed', _)
         return None
     df = pd.read_csv(p)
     return df
