@@ -749,10 +749,8 @@ def main():
             display_cols.append(label)
     display_df = display_df[display_cols].sort_values(by='cluster')
 
-    # compact preview with optional expand
-    preview_rows = st.number_input('Rows to preview', min_value=5, max_value=200, value=10)
-    expand_table = st.checkbox('Expand to full table', value=False)
-    to_show = display_df if expand_table else display_df.head(preview_rows)
+    # show full table (removed preview controls)
+    to_show = display_df
 
     try:
         disp = to_show.copy()
