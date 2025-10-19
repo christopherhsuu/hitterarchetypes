@@ -73,8 +73,9 @@ def merge_candidate_names(main_df):
     """Attempt to enrich main_df with name columns from candidate files.
     Returns a new DataFrame (or the original if no merge succeeded).
     """
-    # Prefer the raw mapping file first
-    preferred = Path('data/raw/unique_batters_with_names.csv')
+    # Prefer the raw mapping file first. Resolve relative to this file so deployments that change cwd still work.
+    ROOT = Path(__file__).resolve().parent
+    preferred = ROOT.joinpath('data/raw/unique_batters_with_names.csv')
     idcol_main = main_df.columns[0]
     if preferred.exists():
         try:
@@ -109,7 +110,7 @@ def merge_candidate_names(main_df):
             pass
 
     # Fallback: try other candidate files using the previous heuristic
-    candidates = [Path('data/unique_batters_with_names.csv'), Path('data/raw/unique_batters.csv'), Path('data/unique_batters.csv')]
+    candidates = [ROOT.joinpath('data/unique_batters_with_names.csv'), ROOT.joinpath('data/raw/unique_batters.csv'), ROOT.joinpath('data/unique_batters.csv')]
     for pth in candidates:
         if not pth.exists():
             continue
@@ -305,8 +306,9 @@ def main():
 
     df['name_display'] = df.apply(canonical_display, axis=1)
     # Build choices from a fallback sequence so we show human names when available.
-    # Preference order: name_display -> name -> any other column containing 'name' -> (optional) id
-    allow_id_fallback = st.sidebar.checkbox('Show IDs when no name available', value=False, help='If enabled, the dropdown will show numeric ids for players missing name mappings.')
+    # Preference order: name_display -> name -> any other column containing 'name'
+    # IMPORTANT: do NOT fall back to showing raw ids by default (this prevents numeric ids from appearing in the UI)
+    allow_id_fallback = False
 
     def build_choices_from_df(df, idcol):
         # helper to collect a list of display strings using fallbacks
@@ -335,7 +337,8 @@ def main():
     if 'name_display' in df.columns:
         mapped_names = df['name_display'].astype(str).str.strip().replace('', pd.NA).dropna().shape[0]
     name_columns = [c for c in df.columns if 'name' in c.lower()]
-    map_files = [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv')]
+    ROOT = Path(__file__).resolve().parent
+    map_files = [ROOT.joinpath('data/raw/unique_batters_with_names.csv'), ROOT.joinpath('data/unique_batters_with_names.csv')]
     present_map_files = [p.as_posix() for p in map_files if p.exists()]
     st.sidebar.markdown('### Data diagnostics')
     st.sidebar.write(f'- total players: {total_players}')
@@ -347,9 +350,9 @@ def main():
         st.sidebar.warning('No mapping CSVs found in data/raw or data/. The dropdown may be empty on deploy.')
     # and surface a visible warning so the deploy owner can fix mapping files.
     if not choices:
-        # Try a direct mapping-file fallback: read mapping CSVs and build names for ids present in df
+        # Try a direct mapping-file fallback: read mapping CSVs (resolved relative to repo root) and build names for ids present in df
         direct_names = []
-        for map_path in [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv'), Path('data/raw/unique_batters.csv')]:
+        for map_path in [ROOT.joinpath('data/raw/unique_batters_with_names.csv'), ROOT.joinpath('data/unique_batters_with_names.csv'), ROOT.joinpath('data/raw/unique_batters.csv')]:
             if not map_path.exists():
                 continue
             try:
@@ -378,12 +381,12 @@ def main():
             choices = direct_names
             st.sidebar.success('Populated dropdown choices using mapping CSVs found in the repo.')
         else:
-            # build choices from id column as strings
-            if idcol_main in df.columns:
+            # no mapping names available — do NOT silently fall back to ids unless user enabled it
+            if allow_id_fallback and idcol_main in df.columns:
                 choices = sorted(df[idcol_main].astype(str).dropna().unique().tolist(), key=lambda s: s.lower())
-                st.sidebar.warning('No human-readable player names found — falling back to player ids in the dropdown. Add `data/raw/unique_batters_with_names.csv` or a `name` column to show names.')
+                st.sidebar.warning('No human-readable player names found — using player ids because you enabled the ID fallback.')
             else:
-                st.sidebar.error('No player names or id column available in the dataset; dropdown will be empty.')
+                st.sidebar.error('No human-readable player names found. Provide data/raw/unique_batters_with_names.csv or enable "Show IDs when no name available" in the sidebar to use ids.')
     # show a small sample so you can see what the dropdown will contain
     try:
         st.sidebar.markdown('**Sample dropdown entries**')
@@ -397,6 +400,13 @@ def main():
 
     selected_name = None
     widget_key_base = stable_widget_key('player', df)
+    # Clear any persisted session state for player widgets so old numeric selections don't reappear
+    try:
+        for k in list(st.session_state.keys()):
+            if isinstance(k, str) and k.startswith(widget_key_base):
+                del st.session_state[k]
+    except Exception:
+        pass
 
     if select_mode == 'Primary (simple)':
         # simple selectbox with deduplicated, alphabetically sorted names (display-only)
