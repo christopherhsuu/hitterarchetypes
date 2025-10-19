@@ -233,53 +233,32 @@ def render_cluster_pca_overview(df, features, use_plotly=HAS_PLOTLY, height=600)
         Xp = pca.fit_transform(Xs)
         emb = pd.DataFrame(Xp, columns=['PC1', 'PC2'], index=df.index)
         emb['cluster'] = df['cluster'].astype(str).values
-        # display with Plotly as one trace per cluster for clarity
+        # Interactive Plotly overview (preferred) — hovering shows player names
         if use_plotly and px is not None:
-            fig = go.Figure()
-            clusters_unique = sorted(emb['cluster'].unique(), key=lambda x: (int(x) if str(x).isdigit() else x))
-            palette = px.colors.qualitative.Safe if hasattr(px.colors.qualitative, 'Safe') else px.colors.qualitative.Plotly
-            # ensure enough colors
-            colors = palette * ((len(clusters_unique) // len(palette)) + 1)
-            for i, cl in enumerate(clusters_unique):
-                sub = emb[emb['cluster'] == cl]
-                # hover info
-                # build a safe names Series (never None) aligned to sub.index
+            try:
+                plot_df = emb.copy()
                 idcol = df.columns[0]
-                if 'name_display' in df.columns:
-                    names = df.loc[sub.index, 'name_display'].astype(object).fillna('').astype(str)
-                elif 'name' in df.columns:
-                    names = df.loc[sub.index, 'name'].astype(object).fillna('').astype(str)
-                else:
-                    names = pd.Series([''] * len(sub), index=sub.index, dtype=str)
-                ids = df.loc[sub.index, idcol].astype(str)
-                hover = list(zip(names.tolist(), ids.tolist()))
-                fig.add_trace(go.Scattergl(x=sub['PC1'], y=sub['PC2'], mode='markers', name=f'Cluster {cl}',
-                                           marker=dict(color=colors[i], size=6, line=dict(width=0.5, color='black')),
-                                           hovertemplate='<b>%{text}</b><br>PC1: %{x:.2f}<br>PC2: %{y:.2f}',
-                                           text=[f"{t[0]} ({t[1]})" for t in hover]))
-            # centroids in PCA space
-            centroids = emb.groupby('cluster')[['PC1','PC2']].mean()
-            fig.add_trace(go.Scattergl(x=centroids['PC1'], y=centroids['PC2'], mode='markers+text',
-                                       marker=dict(symbol='x-open', color='black', size=14),
-                                       text=[f'Centroid {c}' for c in centroids.index], textposition='top center', name='Centroids'))
-            fig.update_layout(title='Cluster PCA overview', xaxis_title='PC1', yaxis_title='PC2', height=height)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            # matplotlib fallback: plot each cluster separately with edgecolors for clarity
-            import matplotlib.pyplot as _plt
-            fig, ax = _plt.subplots(figsize=(10, 6))
-            clusters_unique = sorted(emb['cluster'].unique(), key=lambda x: (int(x) if str(x).isdigit() else x))
-            palette = sns.color_palette(n_colors=len(clusters_unique))
-            for i, cl in enumerate(clusters_unique):
-                sub = emb[emb['cluster'] == cl]
-                ax.scatter(sub['PC1'], sub['PC2'], s=30, color=palette[i], label=f'Cluster {cl}', edgecolors='black', linewidths=0.4, alpha=0.85)
-            centroids = emb.groupby('cluster')[['PC1','PC2']].mean()
-            ax.scatter(centroids['PC1'], centroids['PC2'], s=150, c='black', marker='X')
-            ax.legend()
-            ax.set_title('Cluster PCA overview')
-            ax.set_xlabel('PC1')
-            ax.set_ylabel('PC2')
-            st.pyplot(fig)
+                # attach the id column
+                plot_df[idcol] = df.loc[emb.index, idcol].astype(str).values
+                # build a safe display name series (prefer name_display/name/etc.) and a hover label
+                names = get_display_name_series(df)
+                # align names to emb.index and ensure strings
+                aligned_names = names.reindex(emb.index).fillna('').astype(str).tolist()
+                ids = df.loc[emb.index, idcol].astype(str).tolist()
+                hover_labels = [f"{n} ({i})" if n.strip() else str(i) for n, i in zip(aligned_names, ids)]
+                plot_df['hover_label'] = hover_labels
+                fig = px.scatter(plot_df.reset_index(), x='PC1', y='PC2', color='cluster', hover_name='hover_label', hover_data={idcol: True, 'cluster': True}, height=height)
+                fig.update_traces(marker=dict(size=9, line=dict(width=0.6, color='#111111')), selector=dict(mode='markers'))
+                centroids = emb.groupby('cluster')[['PC1','PC2']].mean().reset_index()
+                fig.add_trace(go.Scatter(x=centroids['PC1'], y=centroids['PC2'], mode='markers+text', marker=dict(symbol='x', color='black', size=18), text=['C'+str(c) for c in centroids['cluster']], textposition='top center', name='Centroids'))
+                fig.update_layout(title='Cluster PCA overview', xaxis_title='PC1', yaxis_title='PC2', legend=dict(orientation='v', x=1.02, y=0.95))
+                st.plotly_chart(fig, use_container_width=True)
+                return emb, centroids
+            except Exception as e:
+                st.write('Interactive cluster overview failed:', e)
+        # If Plotly is not available or failed, inform the user (no static fallback)
+        st.warning('Interactive cluster overview is not available. Install Plotly to enable interactive hover tooltips.')
+        return emb, centroids
 
         return emb, centroids
     except Exception as e:
@@ -354,15 +333,22 @@ def main():
         st.error('Could not find data/player_archetypes.csv')
         return
 
+    # Try to enrich names before rendering the clustering overview so hover tooltips can show human names
+    df = merge_candidate_names(df)
+    # if merge_candidate_names provided a 'name' column, use it as a simple name_display for hover labels
+    if 'name' in df.columns:
+        df['name_display'] = df['name'].fillna('').astype(str).str.strip()
+    else:
+        # ensure column exists to avoid later key errors
+        df['name_display'] = ''
+
     # Render the clustering overview first (top of page)
     # Choose a conservative feature set for the overview: use diagnostic features if available, otherwise numeric columns
     diag_feats = diag.get('params', {}).get('features') if diag else None
     overview_features = [f for f in (diag_feats or df.columns.tolist()) if f in df.columns and pd.api.types.is_numeric_dtype(df[f])]
-    if overview_features:
-        st.header('Cluster overview')
-        emb, centroids = render_cluster_pca_overview(df, overview_features, use_plotly=HAS_PLOTLY, height=500)
-    else:
-        st.info('No numeric features available for cluster overview')
+    st.header('Cluster overview')
+    # Always attempt to render the overview; render_cluster_pca_overview has an internal fallback
+    emb, centroids = render_cluster_pca_overview(df, overview_features, use_plotly=HAS_PLOTLY, height=500)
 
     # try to merge external name mappings early so search uses human names
     df = merge_candidate_names(df)
@@ -615,13 +601,8 @@ def main():
 
     selected_name = None
     widget_key_base = stable_widget_key('player', df)
-    # Clear any persisted session state for player widgets so old numeric selections don't reappear
-    try:
-        for k in list(st.session_state.keys()):
-            if isinstance(k, str) and k.startswith(widget_key_base):
-                del st.session_state[k]
-    except Exception:
-        pass
+    # (Do not clear session_state here) allow Streamlit to persist selection widgets normally so
+    # when the user selects a player the rest of the page updates correctly.
 
     if select_mode == 'Primary (simple)':
         # simple selectbox with deduplicated, alphabetically sorted names (display-only)
@@ -788,8 +769,68 @@ def main():
     except Exception:
         st.dataframe(to_show)
 
+    # If a player is selected, show a concise search result (player + stats + cluster)
+    if selected_name:
+        try:
+            prow = df_search.iloc[0]
+        except Exception:
+            prow = df[df['name_display'].astype(str).str.strip() == selected_name].iloc[0]
+        st.header('Search result')
+        display_val = ''
+        if 'name_display' in prow.index and str(prow.get('name_display')).strip():
+            display_val = prow.get('name_display')
+        elif 'name' in prow.index and str(prow.get('name')).strip():
+            display_val = prow.get('name')
+        else:
+            display_val = str(prow[df.columns[0]])
+        st.subheader(f"{display_val}  —  Cluster {prow.get('cluster')}")
+        # build a compact stats table using friendly labels where possible
+        stats_rows = []
+        idcol = df.columns[0]
+        stats_rows.append(('id', str(prow.get(idcol))))
+        stats_rows.append(('cluster', str(prow.get('cluster'))))
+        # friendly mapping first (chosen_mapping contains friendly_label -> raw_column)
+        for label, raw in chosen_mapping.items():
+            if raw in prow.index:
+                stats_rows.append((label, prow.get(raw)))
+        # then include any remaining numeric features the pipeline uses (avoid duplicates)
+        used_raws = set(chosen_mapping.values())
+        for f in features:
+            if f in prow.index and f not in used_raws:
+                stats_rows.append((f, prow.get(f)))
+        stats_df = pd.DataFrame(stats_rows, columns=['metric', 'value']).set_index('metric')
+        # Sanitize dataframe for Streamlit/pyarrow serialization:
+        # - decode bytes to str, format numeric values to 2 decimals, and replace NaN with empty string
+        def _sanitize_cell(v):
+            try:
+                if v is None:
+                    return ''
+                if isinstance(v, (bytes, bytearray)):
+                    try:
+                        return v.decode('utf-8')
+                    except Exception:
+                        return str(v)
+                if pd.isna(v):
+                    return ''
+                if isinstance(v, (int, np.integer)):
+                    return str(int(v))
+                if isinstance(v, (float, np.floating, np.number)):
+                    # format floats with 2 decimals
+                    try:
+                        return f"{float(v):.2f}"
+                    except Exception:
+                        return str(v)
+                return str(v)
+            except Exception:
+                return str(v)
+
+        safe_stats = stats_df.copy()
+        for c in safe_stats.columns:
+            safe_stats[c] = safe_stats[c].apply(_sanitize_cell)
+        st.table(safe_stats)
+
     # PCA plot (preprocess numeric features to avoid domination by raw scales/outliers)
-    if show_pca:
+    if show_pca and not selected_name:
         feat_df = sub[features].select_dtypes(include=[np.number]).copy()
         feat_df = feat_df.fillna(0)
         if feat_df.shape[1] >= 2 and feat_df.shape[0] >= 2:
