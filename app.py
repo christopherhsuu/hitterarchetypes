@@ -304,8 +304,31 @@ def main():
         return ''
 
     df['name_display'] = df.apply(canonical_display, axis=1)
-    # Build choices from name_display only (non-empty, unique, sorted)
-    choices = sorted(df['name_display'].dropna().astype(str).str.strip().replace('', pd.NA).dropna().unique(), key=lambda s: s.lower())
+    # Build choices from a fallback sequence so we show human names when available.
+    # Preference order: name_display -> name -> any other column containing 'name' -> (optional) id
+    allow_id_fallback = st.sidebar.checkbox('Show IDs when no name available', value=False, help='If enabled, the dropdown will show numeric ids for players missing name mappings.')
+
+    def build_choices_from_df(df, idcol):
+        # helper to collect a list of display strings using fallbacks
+        vals = []
+        # primary: explicit name_display
+        if 'name_display' in df.columns:
+            vals.extend(df['name_display'].dropna().astype(str).str.strip().replace('', pd.NA).dropna().tolist())
+        # secondary: normalized 'name' column
+        if 'name' in df.columns:
+            vals.extend(df['name'].dropna().astype(str).str.strip().replace('', pd.NA).dropna().tolist())
+        # tertiary: any other column with 'name' in the column name
+        for c in df.columns:
+            if c not in ('name_display','name') and 'name' in c.lower():
+                vals.extend(df[c].dropna().astype(str).str.strip().replace('', pd.NA).dropna().tolist())
+        # optionally fall back to id column
+        if allow_id_fallback and idcol in df.columns:
+            vals.extend(df[idcol].astype(str).dropna().astype(str).str.strip().replace('', pd.NA).dropna().tolist())
+        # unique + sort
+        uniq = sorted(set([v for v in vals if v is not None and str(v).strip()]), key=lambda s: s.lower())
+        return uniq
+
+    choices = build_choices_from_df(df, idcol_main)
     summaries = build_player_summary(df, name_col='name_display', season_col='Season')
 
     st.sidebar.markdown('### Player selection')
