@@ -271,6 +271,48 @@ def main():
     choices = build_player_choices(df, name_col=name_col, sort=True)
     summaries = build_player_summary(df, name_col=name_col, season_col='Season')
 
+    # If choices look like numeric ids (most entries numeric), try to load a mapping file and
+    # replace ids with human-readable names both in the choices list and the dataframe.
+    def looks_numeric(s):
+        try:
+            int(s)
+            return True
+        except Exception:
+            return False
+
+    num_count = sum(1 for c in choices if looks_numeric(c))
+    if choices and num_count > max(3, len(choices) // 3):
+        # attempt to load mapping from known paths
+        mapping = {}
+        for map_path in [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv')]:
+            if map_path.exists():
+                try:
+                    mm = pd.read_csv(map_path, dtype=str)
+                    # pick columns: id-like and name-like
+                    idc = next((c for c in mm.columns if c.lower() in ('batter','playerid','mlbam','id','key')), None)
+                    namec = next((c for c in mm.columns if 'name' in c.lower() or 'full' in c.lower()), None)
+                    if idc and namec:
+                        mm[idc] = mm[idc].astype(str).str.strip()
+                        mm[namec] = mm[namec].astype(str).str.strip()
+                        mapping.update(mm.set_index(idc)[namec].to_dict())
+                except Exception:
+                    continue
+        if mapping:
+            # map choices and df[name]
+            mapped_choices = []
+            seen = set()
+            for c in choices:
+                mapped = mapping.get(str(c).strip(), c)
+                if mapped not in seen:
+                    mapped_choices.append(mapped)
+                    seen.add(mapped)
+            choices = mapped_choices
+            # ensure df has a 'name' column reflecting mapping
+            if name_col != 'name':
+                df['name'] = df[name_col].astype(str).str.strip().map(lambda x: mapping.get(x, x))
+            else:
+                df['name'] = df['name'].astype(str).str.strip().map(lambda x: mapping.get(x, x))
+
     st.sidebar.markdown('### Player selection')
     select_mode = st.sidebar.radio('Selection mode', ['Primary (simple)', 'Disambiguation (name + year)', 'Substring filter', 'Fuzzy (optional)'])
 
