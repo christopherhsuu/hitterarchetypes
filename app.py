@@ -192,6 +192,123 @@ def cluster_representatives(df, cluster_label, features_list, n_closest=3, n_far
     return closest, far
 
 
+def render_cluster_pca_overview(df, features, use_plotly=HAS_PLOTLY, height=600):
+    """Render a clear PCA overview of all players colored by cluster.
+    Shows one trace per cluster plus centroid markers and returns the PCA embedding and centroids.
+    """
+    try:
+        feats = [c for c in features if c in df.columns]
+        # If automatic feature selection fails, fall back to a canonical small set
+        canonical = ['launch_speed_mean', 'launch_angle_mean', 'bat_speed_mean', 'pct_hard_hit', 'n_swings']
+        fallback = [c for c in canonical if c in df.columns]
+        if len(feats) < 2:
+            feats = fallback
+        if len(feats) < 2 or df.shape[0] < 2:
+            st.info('Not enough data to render cluster overview')
+            return None, None
+
+        # prepare feature matrix
+        feat_df = df[feats].select_dtypes(include=[np.number]).fillna(0).copy()
+        # basic preprocessing: log counts, winsorize, robust scale (keep consistent with PCA block)
+        angle_cols = [c for c in feat_df.columns if ('angle' in c.lower() or 'direction' in c.lower()) and c.lower().endswith('_mean')]
+        for c in angle_cols:
+            rad = np.deg2rad(feat_df[c].astype(float).fillna(0).values)
+            feat_df[c + '_sin'] = np.sin(rad)
+            feat_df[c + '_cos'] = np.cos(rad)
+            feat_df.drop(columns=[c], inplace=True)
+        count_cols = [c for c in feat_df.columns if c.lower().startswith('n_') or c.lower().endswith('_count') or c.lower() == 'n_swings']
+        for c in count_cols:
+            feat_df[c] = np.log1p(feat_df[c].astype(float).fillna(0))
+        for c in feat_df.columns:
+            lo = feat_df[c].quantile(0.01)
+            hi = feat_df[c].quantile(0.99)
+            if pd.notna(lo) and pd.notna(hi) and lo < hi:
+                feat_df[c] = feat_df[c].clip(lower=lo, upper=hi)
+        from sklearn.preprocessing import RobustScaler
+        from sklearn.decomposition import PCA
+
+        scaler = RobustScaler()
+        Xs = scaler.fit_transform(feat_df.values)
+        pca = PCA(n_components=2)
+        Xp = pca.fit_transform(Xs)
+        emb = pd.DataFrame(Xp, columns=['PC1', 'PC2'], index=df.index)
+        emb['cluster'] = df['cluster'].astype(str).values
+        # display with Plotly as one trace per cluster for clarity
+        if use_plotly and px is not None:
+            fig = go.Figure()
+            clusters_unique = sorted(emb['cluster'].unique(), key=lambda x: (int(x) if str(x).isdigit() else x))
+            palette = px.colors.qualitative.Safe if hasattr(px.colors.qualitative, 'Safe') else px.colors.qualitative.Plotly
+            # ensure enough colors
+            colors = palette * ((len(clusters_unique) // len(palette)) + 1)
+            for i, cl in enumerate(clusters_unique):
+                sub = emb[emb['cluster'] == cl]
+                # hover info
+                # build a safe names Series (never None) aligned to sub.index
+                idcol = df.columns[0]
+                if 'name_display' in df.columns:
+                    names = df.loc[sub.index, 'name_display'].astype(object).fillna('').astype(str)
+                elif 'name' in df.columns:
+                    names = df.loc[sub.index, 'name'].astype(object).fillna('').astype(str)
+                else:
+                    names = pd.Series([''] * len(sub), index=sub.index, dtype=str)
+                ids = df.loc[sub.index, idcol].astype(str)
+                hover = list(zip(names.tolist(), ids.tolist()))
+                fig.add_trace(go.Scattergl(x=sub['PC1'], y=sub['PC2'], mode='markers', name=f'Cluster {cl}',
+                                           marker=dict(color=colors[i], size=6, line=dict(width=0.5, color='black')),
+                                           hovertemplate='<b>%{text}</b><br>PC1: %{x:.2f}<br>PC2: %{y:.2f}',
+                                           text=[f"{t[0]} ({t[1]})" for t in hover]))
+            # centroids in PCA space
+            centroids = emb.groupby('cluster')[['PC1','PC2']].mean()
+            fig.add_trace(go.Scattergl(x=centroids['PC1'], y=centroids['PC2'], mode='markers+text',
+                                       marker=dict(symbol='x-open', color='black', size=14),
+                                       text=[f'Centroid {c}' for c in centroids.index], textposition='top center', name='Centroids'))
+            fig.update_layout(title='Cluster PCA overview', xaxis_title='PC1', yaxis_title='PC2', height=height)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            # matplotlib fallback: plot each cluster separately with edgecolors for clarity
+            import matplotlib.pyplot as _plt
+            fig, ax = _plt.subplots(figsize=(10, 6))
+            clusters_unique = sorted(emb['cluster'].unique(), key=lambda x: (int(x) if str(x).isdigit() else x))
+            palette = sns.color_palette(n_colors=len(clusters_unique))
+            for i, cl in enumerate(clusters_unique):
+                sub = emb[emb['cluster'] == cl]
+                ax.scatter(sub['PC1'], sub['PC2'], s=30, color=palette[i], label=f'Cluster {cl}', edgecolors='black', linewidths=0.4, alpha=0.85)
+            centroids = emb.groupby('cluster')[['PC1','PC2']].mean()
+            ax.scatter(centroids['PC1'], centroids['PC2'], s=150, c='black', marker='X')
+            ax.legend()
+            ax.set_title('Cluster PCA overview')
+            ax.set_xlabel('PC1')
+            ax.set_ylabel('PC2')
+            st.pyplot(fig)
+
+        return emb, centroids
+    except Exception as e:
+        st.write('Cluster overview failed:', e)
+        return None, None
+
+
+def generate_cluster_descriptions(df, features, top_n=3):
+    """Return a dict of textual descriptions for each cluster using z-scored centroids."""
+    feats = [c for c in features if c in df.columns]
+    if not feats:
+        return {}
+    centroids = df.set_index('cluster')[feats].groupby(level=0).mean()
+    overall_mean = centroids.mean(axis=0)
+    overall_std = centroids.std(axis=0).replace(0, 1)
+    z = (centroids - overall_mean) / overall_std
+    descriptions = {}
+    for cl in centroids.index:
+        row = z.loc[cl].sort_values(ascending=False)
+        top_pos = row[row > 0].head(top_n).index.tolist()
+        top_neg = row[row < 0].head(top_n).index.tolist()
+        pos_text = ', '.join(top_pos) if top_pos else 'no strong positive distinguishing features'
+        neg_text = ', '.join(top_neg) if top_neg else 'no strong negative distinguishing features'
+        desc = f"Cluster {cl}: Players in this cluster tend to have higher-than-average {pos_text} and lower-than-average {neg_text}. "
+        desc += "In short, membership is driven by these feature differences — players with similar values across these features are grouped together."
+        descriptions[str(cl)] = desc
+    return descriptions
+
+
 @st.cache_data
 def load_player_archetypes(path='data/player_archetypes.csv'):
     p = Path(path)
@@ -236,6 +353,16 @@ def main():
     if df is None:
         st.error('Could not find data/player_archetypes.csv')
         return
+
+    # Render the clustering overview first (top of page)
+    # Choose a conservative feature set for the overview: use diagnostic features if available, otherwise numeric columns
+    diag_feats = diag.get('params', {}).get('features') if diag else None
+    overview_features = [f for f in (diag_feats or df.columns.tolist()) if f in df.columns and pd.api.types.is_numeric_dtype(df[f])]
+    if overview_features:
+        st.header('Cluster overview')
+        emb, centroids = render_cluster_pca_overview(df, overview_features, use_plotly=HAS_PLOTLY, height=500)
+    else:
+        st.info('No numeric features available for cluster overview')
 
     # try to merge external name mappings early so search uses human names
     df = merge_candidate_names(df)
@@ -578,9 +705,16 @@ def main():
             except Exception:
                 return str(x)
 
+        # generate plain-English cluster descriptions
+        cluster_texts = generate_cluster_descriptions(df, features_list, top_n=3)
+
         for cl in sorted(centroids.index.tolist(), key=sort_key):
             with st.expander(f'Cluster {cl} summary', expanded=False):
                 st.subheader(f'Cluster {cl}')
+                # show the plain-English explanation we generated
+                txt = cluster_texts.get(str(cl), '')
+                if txt:
+                    st.markdown(f"**Summary:** {txt}")
                 # top positive z-score features for this cluster
                 # use the actual index value `cl` when indexing zcent (preserves dtype)
                 row = zcent.loc[cl]
@@ -710,35 +844,37 @@ def main():
                 evr = pca.explained_variance_ratio_
                 st.caption(f'PCA explained variance ratio: PC1={evr[0]:.2f}, PC2={evr[1]:.2f}')
                 # Plot: prefer Plotly if available, otherwise fallback to matplotlib + seaborn
-                if HAS_PLOTLY and px is not None:
-                    fig = px.scatter(pxdf, x='PC1', y='PC2', color='cluster', hover_data=['name','id'], height=600)
-                    fig.update_layout(xaxis_title='PC1', yaxis_title='PC2', title='PCA of selected players')
+                if use_plotly and px is not None:
+                    fig = go.Figure()
+                    clusters_unique = sorted(emb['cluster'].unique(), key=lambda x: (int(x) if str(x).isdigit() else x))
+                    # pick a high-contrast qualitative palette
+                    base_palette = px.colors.qualitative.Plotly
+                    colors = (base_palette * ((len(clusters_unique) // len(base_palette)) + 1))[:len(clusters_unique)]
+                    for i, cl in enumerate(clusters_unique):
+                        sub = emb[emb['cluster'] == cl]
+                        idcol = df.columns[0]
+                        if 'name_display' in df.columns:
+                            names = df.loc[sub.index, 'name_display'].astype(object).fillna('').astype(str)
+                        elif 'name' in df.columns:
+                            names = df.loc[sub.index, 'name'].astype(object).fillna('').astype(str)
+                        else:
+                            names = pd.Series([''] * len(sub), index=sub.index, dtype=str)
+                        ids = df.loc[sub.index, idcol].astype(str)
+                        hover_text = [f"{n} ({i0})" if n else f"{i0}" for n, i0 in zip(names.tolist(), ids.tolist())]
+                        fig.add_trace(go.Scattergl(x=sub['PC1'], y=sub['PC2'], mode='markers', name=f'Cluster {cl}',
+                                                   marker=dict(color=colors[i], size=9, opacity=0.85, line=dict(width=0.7, color='#222')),
+                                                   hoverinfo='text', text=hover_text))
+                    # centroids in PCA space
+                    centroids = emb.groupby('cluster')[['PC1','PC2']].mean()
+                    fig.add_trace(go.Scattergl(x=centroids['PC1'], y=centroids['PC2'], mode='markers+text',
+                                               marker=dict(symbol='x', color='black', size=16),
+                                               text=[f'Centroid {c}' for c in centroids.index], textposition='top center', name='Centroids'))
+                    # add annotations for centroids for clarity
+                    annotations = []
+                    for c_idx, row in centroids.reset_index().iterrows():
+                        annotations.append(dict(x=row['PC1'], y=row['PC2'], text=f"C{row['cluster']}", showarrow=False, yshift=10, font=dict(color='black', size=12)))
+                    fig.update_layout(title='Cluster PCA overview', xaxis_title='PC1', yaxis_title='PC2', height=height, annotations=annotations)
                     st.plotly_chart(fig, use_container_width=True)
-                else:
-                    import matplotlib.pyplot as _plt
-                    fig_m, ax_m = _plt.subplots(figsize=(8, 6))
-                    # color by cluster category
-                    clusters_unique = list(pxdf['cluster'].unique())
-                    palette = sns.color_palette(n_colors=len(clusters_unique))
-                    color_map = {c: palette[i] for i, c in enumerate(clusters_unique)}
-                    colors = pxdf['cluster'].map(color_map)
-                    ax_m.scatter(pxdf['PC1'], pxdf['PC2'], c=list(colors), s=40, alpha=0.8)
-                    ax_m.set_xlabel('PC1')
-                    ax_m.set_ylabel('PC2')
-                    ax_m.set_title('PCA of selected players')
-                    st.pyplot(fig_m)
-            except Exception as e:
-                st.write('PCA failed:', e)
-        else:
-            st.info('Not enough numeric features to compute PCA')
-
-    # Interactive scatter between any two selected features
-    if show_scatter:
-        numeric_features = [c for c in features if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
-        if len(numeric_features) >= 2:
-            c1 = st.selectbox('X feature', options=numeric_features, index=0)
-            c2 = st.selectbox('Y feature', options=numeric_features, index=1 if len(numeric_features) > 1 else 0)
-            try:
                 scatter_df = df[[c1, c2, 'cluster']].copy()
                 # ensure a name column for hover (prefer name_display)
                 if 'name_display' in df.columns:
