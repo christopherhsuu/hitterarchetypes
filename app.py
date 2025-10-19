@@ -906,10 +906,8 @@ def main():
             st.info('Not enough numeric features for scatter')
 
     # Player detail: driven by top-search selections (no separate search box)
-    st.subheader('Player detail')
     idcol = df.columns[0]
     # Player detail driven by the new selection UI: `selected_name` (canonical Name string)
-    st.subheader('Player detail')
     if selected_name:
         # find the row in the filtered `df_search` (which contains rows for selected_name) or fall back to df
         try:
@@ -937,19 +935,71 @@ def main():
             player_feats = player_feats.astype(float)
             comp = player_feats.join(centroid).dropna()
             st.dataframe(comp)
-            diff = (comp['player'] - comp['cluster_mean']).reset_index()
-            diff.columns = ['feature', 'diff']
-            # Bar chart comparing player vs cluster mean
+            # Compute differences robustly: handle circular angle features and show z-scored diffs
+            # We'll compute cluster mean/std per-feature for the player's cluster using circular stats for angles.
+            player_cluster = str(prow['cluster'])
+            cluster_df = df[df['cluster'].astype(str) == player_cluster]
+            rows = []
+            for feat in comp.index:
+                pval = float(comp.loc[feat, 'player'])
+                # default cluster mean from centroid table
+                cval = float(centroid.loc[feat, 'cluster_mean'])
+                # detect circular feature
+                is_circular = (('angle' in feat.lower() or 'direction' in feat.lower()) and feat.lower().endswith('_mean'))
+                if is_circular:
+                    # compute circular mean/std from raw player values in the cluster
+                    vals = cluster_df[feat].dropna().astype(float)
+                    if len(vals) >= 1:
+                        rad = np.deg2rad(vals.values)
+                        ms = np.sin(rad).mean()
+                        mc = np.cos(rad).mean()
+                        R = np.hypot(ms, mc)
+                        # mean angle in radians
+                        mean_rad = np.arctan2(ms, mc)
+                        mean_deg = np.rad2deg(mean_rad)
+                        cval = float(mean_deg)
+                        # circular std (radians): sqrt(-2 ln R) ; convert to degrees
+                        if R <= 0 or np.isnan(R):
+                            cstd = 1.0
+                        else:
+                            std_rad = np.sqrt(max(0.0, -2.0 * np.log(min(max(R, 1e-12), 1.0))))
+                            cstd = float(std_rad * 180.0 / np.pi)
+                            if not (cstd and pd.notna(cstd)):
+                                cstd = 1.0
+                    else:
+                        # fallback to arithmetic centroid/std
+                        try:
+                            cstd = float(cluster_df[feat].std()) if pd.notna(cluster_df[feat].std()) else 1.0
+                        except Exception:
+                            cstd = 1.0
+                else:
+                    # numeric feature: compute arithmetic mean/std in cluster
+                    try:
+                        cstd = float(cluster_df[feat].std()) if pd.notna(cluster_df[feat].std()) else 1.0
+                        # use centroid arithmetic mean as cval (already present)
+                    except Exception:
+                        cstd = 1.0
+                # compute delta with circular wrapping when needed
+                if is_circular:
+                    delta = ((pval - cval + 180.0) % 360.0) - 180.0
+                else:
+                    delta = (pval - cval)
+                diff_z = delta / cstd if cstd != 0 else delta
+                rows.append({'feature': feat, 'diff': delta, 'diff_z': diff_z})
+            diffdf = pd.DataFrame(rows).set_index('feature')
+            # Bar chart comparing player vs cluster mean (z-scores)
+            st.caption('Values shown are player - cluster_mean, normalized by cluster std (z-score). Circular angle means are compared using minimal signed angle difference.')
             if HAS_PLOTLY and px is not None:
-                fig3 = px.bar(diff, x='feature', y='diff', title='Player - cluster mean')
+                fig3 = px.bar(diffdf.reset_index(), x='feature', y='diff_z', title='Player - cluster mean (z-score)', labels={'diff_z': 'diff (z-score)'})
+                fig3.update_xaxes(tickangle=-45)
                 st.plotly_chart(fig3, use_container_width=True)
             else:
                 import matplotlib.pyplot as _plt
                 fig3, ax3 = _plt.subplots(figsize=(8, 3))
-                ax3.bar(diff['feature'], diff['diff'])
-                ax3.set_xticklabels(diff['feature'], rotation=45, ha='right')
-                ax3.set_ylabel('diff')
-                ax3.set_title('Player - cluster mean')
+                ax3.bar(diffdf.index, diffdf['diff_z'])
+                ax3.set_xticklabels(diffdf.index, rotation=45, ha='right')
+                ax3.set_ylabel('diff (z-score)')
+                ax3.set_title('Player - cluster mean (z-score)')
                 st.pyplot(fig3)
         except Exception as e:
             st.write('Player detail failed:', e)
