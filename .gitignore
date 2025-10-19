@@ -1,1 +1,16 @@
+# Ignore CSVs by default but explicitly include essential app data files
 *.csv
+
+# Re-include essential data files used by the Streamlit app
+!data/player_archetypes.csv
+!data/raw/unique_batters_with_names.csv
+!data/unique_batters_with_names.csv
+
+# Other common ignores
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+
+# Editor/IDE
+.vscode/*.csv
