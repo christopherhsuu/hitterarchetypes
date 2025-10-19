@@ -329,6 +329,67 @@ def main():
         return uniq
 
     choices = build_choices_from_df(df, idcol_main)
+    # quick in-app diagnostics to help deployments where mapping files may be missing
+    total_players = len(df)
+    mapped_names = 0
+    if 'name_display' in df.columns:
+        mapped_names = df['name_display'].astype(str).str.strip().replace('', pd.NA).dropna().shape[0]
+    name_columns = [c for c in df.columns if 'name' in c.lower()]
+    map_files = [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv')]
+    present_map_files = [p.as_posix() for p in map_files if p.exists()]
+    st.sidebar.markdown('### Data diagnostics')
+    st.sidebar.write(f'- total players: {total_players}')
+    st.sidebar.write(f'- players with mapped display name: {mapped_names}')
+    st.sidebar.write(f'- name-like columns: {name_columns}')
+    if present_map_files:
+        st.sidebar.write(f'- mapping files found: {present_map_files}')
+    else:
+        st.sidebar.warning('No mapping CSVs found in data/raw or data/. The dropdown may be empty on deploy.')
+    # and surface a visible warning so the deploy owner can fix mapping files.
+    if not choices:
+        # Try a direct mapping-file fallback: read mapping CSVs and build names for ids present in df
+        direct_names = []
+        for map_path in [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv'), Path('data/raw/unique_batters.csv')]:
+            if not map_path.exists():
+                continue
+            try:
+                mm = pd.read_csv(map_path, dtype=str)
+            except Exception:
+                continue
+            idc = next((c for c in mm.columns if c.lower() in ('batter','playerid','mlbam','id','key')), None)
+            namec = next((c for c in mm.columns if 'name' in c.lower() or 'full' in c.lower()), None)
+            if not idc or not namec:
+                # attempt heuristic: use first two columns
+                if mm.shape[1] >= 2:
+                    idc = mm.columns[0]
+                    namec = mm.columns[1]
+                else:
+                    continue
+            mm[idc] = mm[idc].astype(str).str.strip()
+            mm[namec] = mm[namec].astype(str).str.strip()
+            # only keep mapping for ids present in df
+            ids_in_df = set(df[idcol_main].astype(str).str.strip().unique())
+            filtered = mm[mm[idc].isin(ids_in_df)]
+            if filtered.empty:
+                continue
+            direct_names.extend(filtered[namec].dropna().astype(str).str.strip().tolist())
+        direct_names = sorted(set([n for n in direct_names if n and not str(n).strip().isdigit()]), key=lambda s: s.lower())
+        if direct_names:
+            choices = direct_names
+            st.sidebar.success('Populated dropdown choices using mapping CSVs found in the repo.')
+        else:
+            # build choices from id column as strings
+            if idcol_main in df.columns:
+                choices = sorted(df[idcol_main].astype(str).dropna().unique().tolist(), key=lambda s: s.lower())
+                st.sidebar.warning('No human-readable player names found — falling back to player ids in the dropdown. Add `data/raw/unique_batters_with_names.csv` or a `name` column to show names.')
+            else:
+                st.sidebar.error('No player names or id column available in the dataset; dropdown will be empty.')
+    # show a small sample so you can see what the dropdown will contain
+    try:
+        st.sidebar.markdown('**Sample dropdown entries**')
+        st.sidebar.write(choices[:10])
+    except Exception:
+        pass
     summaries = build_player_summary(df, name_col='name_display', season_col='Season')
 
     st.sidebar.markdown('### Player selection')
