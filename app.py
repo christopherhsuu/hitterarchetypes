@@ -56,7 +56,7 @@ def get_display_name_series(df):
     """Return a safe series to use as the player display name.
     Tries common columns; falls back to the first column (id).
     """
-    candidates = ['name', 'full_name', 'display_name']
+    candidates = ['name_display', 'name', 'full_name', 'display_name']
     for c in candidates:
         if c in df.columns:
             return df[c].fillna('').astype(str)
@@ -100,10 +100,10 @@ def merge_candidate_names(main_df):
                 map_series[namec] = map_series[namec].astype(str).str.strip()
                 mapping = map_series.set_index(idc)[namec].to_dict()
                 # create a name column by mapping the main id column
+                # DO NOT fill missing names with the raw id (this caused numeric ids to appear in the UI)
                 main_df = main_df.copy()
                 main_df['name'] = main_df[idcol_main].astype(str).str.strip().map(mapping)
-                # if any names still missing, leave them as original id string
-                main_df['name'] = main_df['name'].fillna(main_df[idcol_main].astype(str))
+                # leave unmatched names as NaN/empty; display logic will prefer human names and avoid showing raw ids
                 return main_df
         except Exception:
             pass
@@ -179,8 +179,11 @@ def cluster_representatives(df, cluster_label, features_list, n_closest=3, n_far
     cluster_idx = dists[mask].sort_values()
     closest_idx = cluster_idx.head(n_closest).index.tolist()
     far_idx = cluster_idx.tail(n_farthest).index.tolist()
-    # return display names for these indices
-    names = get_display_name_series(df)
+    # return display names for these indices (prefer name_display if available)
+    if 'name_display' in df.columns:
+        names = df['name_display'].fillna('').astype(str)
+    else:
+        names = get_display_name_series(df)
     closest = [(i, names.loc[i]) for i in closest_idx]
     far = [(i, names.loc[i]) for i in far_idx]
     return closest, far
@@ -234,9 +237,9 @@ def main():
     df = merge_candidate_names(df)
 
     # Normalize any human name columns on load so selection helpers get canonical strings
-    # If a 'name' column exists, normalize it; otherwise we'll merge-in names above.
+    # If a 'name' column exists, normalize it and keep missing as empty string (do not fill with ids)
     if 'name' in df.columns:
-        df['name'] = df['name'].astype(str).str.strip()
+        df['name'] = df['name'].fillna('').astype(str).str.strip()
 
     st.sidebar.header('Options')
     clusters = sorted(df['cluster'].astype(str).unique(), key=lambda x: (int(x) if x.isdigit() else x))
@@ -266,52 +269,44 @@ def main():
     # Player selection helpers
     from utils.player_select import build_player_choices, build_player_summary, stable_widget_key
 
-    # Create canonical choices and summaries (use 'name' column if present)
-    name_col = 'name' if 'name' in df.columns else df.columns[0]
-    choices = build_player_choices(df, name_col=name_col, sort=True)
-    summaries = build_player_summary(df, name_col=name_col, season_col='Season')
+    # Create a robust display name column and choices derived from it so UI shows names only
+    idcol_main = df.columns[0]
+    mapping = {}
+    for map_path in [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv')]:
+        if map_path.exists():
+            try:
+                mm = pd.read_csv(map_path, dtype=str)
+                idc = next((c for c in mm.columns if c.lower() in ('batter','playerid','mlbam','id','key')), None)
+                namec = next((c for c in mm.columns if 'name' in c.lower() or 'full' in c.lower()), None)
+                if idc and namec:
+                    mm[idc] = mm[idc].astype(str).str.strip()
+                    mm[namec] = mm[namec].astype(str).str.strip()
+                    mapping.update(mm.set_index(idc)[namec].to_dict())
+            except Exception:
+                pass
 
-    # If choices look like numeric ids (most entries numeric), try to load a mapping file and
-    # replace ids with human-readable names both in the choices list and the dataframe.
-    def looks_numeric(s):
-        try:
-            int(s)
-            return True
-        except Exception:
-            return False
+    def canonical_display(row):
+        # prefer an explicit display column if present
+        if 'name_display' in df.columns and row.get('name_display') and str(row.get('name_display')).strip():
+            nm0 = str(row.get('name_display')).strip()
+            if not nm0.isdigit():
+                return nm0
+        # prefer existing human name if available and non-numeric
+        if 'name' in df.columns:
+            nm = row.get('name')
+            if isinstance(nm, str) and nm.strip() and not nm.strip().isdigit():
+                return nm.strip()
+        # try mapping via id
+        rid = str(row[idcol_main]).strip()
+        if rid in mapping:
+            return mapping[rid]
+        # fallback: empty string to avoid showing raw id
+        return ''
 
-    num_count = sum(1 for c in choices if looks_numeric(c))
-    if choices and num_count > max(3, len(choices) // 3):
-        # attempt to load mapping from known paths
-        mapping = {}
-        for map_path in [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv')]:
-            if map_path.exists():
-                try:
-                    mm = pd.read_csv(map_path, dtype=str)
-                    # pick columns: id-like and name-like
-                    idc = next((c for c in mm.columns if c.lower() in ('batter','playerid','mlbam','id','key')), None)
-                    namec = next((c for c in mm.columns if 'name' in c.lower() or 'full' in c.lower()), None)
-                    if idc and namec:
-                        mm[idc] = mm[idc].astype(str).str.strip()
-                        mm[namec] = mm[namec].astype(str).str.strip()
-                        mapping.update(mm.set_index(idc)[namec].to_dict())
-                except Exception:
-                    continue
-        if mapping:
-            # map choices and df[name]
-            mapped_choices = []
-            seen = set()
-            for c in choices:
-                mapped = mapping.get(str(c).strip(), c)
-                if mapped not in seen:
-                    mapped_choices.append(mapped)
-                    seen.add(mapped)
-            choices = mapped_choices
-            # ensure df has a 'name' column reflecting mapping
-            if name_col != 'name':
-                df['name'] = df[name_col].astype(str).str.strip().map(lambda x: mapping.get(x, x))
-            else:
-                df['name'] = df['name'].astype(str).str.strip().map(lambda x: mapping.get(x, x))
+    df['name_display'] = df.apply(canonical_display, axis=1)
+    # Build choices from name_display only (non-empty, unique, sorted)
+    choices = sorted(df['name_display'].dropna().astype(str).str.strip().replace('', pd.NA).dropna().unique(), key=lambda s: s.lower())
+    summaries = build_player_summary(df, name_col='name_display', season_col='Season')
 
     st.sidebar.markdown('### Player selection')
     select_mode = st.sidebar.radio('Selection mode', ['Primary (simple)', 'Disambiguation (name + year)', 'Substring filter', 'Fuzzy (optional)'])
@@ -320,8 +315,9 @@ def main():
     widget_key_base = stable_widget_key('player', df)
 
     if select_mode == 'Primary (simple)':
-        # simple selectbox with deduplicated, alphabetically sorted names
-        selected_name = st.selectbox('Player', options=choices, key=widget_key_base + ':player-simple')
+        # simple selectbox with deduplicated, alphabetically sorted names (display-only)
+        selected_display = st.selectbox('Player', options=choices, key=widget_key_base + ':player-simple')
+        selected_name = selected_display
 
     elif select_mode == 'Disambiguation (name + year)':
         # Build options like 'Name (last: YEAR)' but return canonical Name
@@ -334,6 +330,7 @@ def main():
         display_opts = [lab for lab, _ in labels]
         choice_map = {lab: canon for lab, canon in labels}
         sel = st.selectbox('Player', options=display_opts, key=widget_key_base + ':player-disamb')
+        selected_display = sel
         selected_name = choice_map.get(sel)
 
     elif select_mode == 'Substring filter':
@@ -343,7 +340,8 @@ def main():
             filtered = [c for c in choices if ql in c.lower()]
         else:
             filtered = choices
-        selected_name = st.selectbox('Player (filtered)', options=filtered, key=widget_key_base + ':player-substr-select')
+        selected_display = st.selectbox('Player (filtered)', options=filtered, key=widget_key_base + ':player-substr-select')
+        selected_name = selected_display
 
     elif select_mode == 'Fuzzy (optional)':
         try:
@@ -358,15 +356,17 @@ def main():
             if not top:
                 st.info('Enter a query above to get fuzzy matches')
             else:
-                selected_name = st.selectbox('Fuzzy matches', options=top, key=widget_key_base + ':player-fuzzy-select')
+                selected_display = st.selectbox('Fuzzy matches', options=top, key=widget_key_base + ':player-fuzzy-select')
+                selected_name = selected_display
         except Exception:
             st.warning('rapidfuzz not installed: install rapidfuzz to enable fuzzy search')
-            selected_name = st.selectbox('Player', options=choices, key=widget_key_base + ':player-fallback')
+            selected_display = st.selectbox('Player', options=choices, key=widget_key_base + ':player-fallback')
+            selected_name = selected_display
 
     # After selection, filter the main DataFrame to the selected player (if any)
     if selected_name:
-        # choose rows matching the canonical name
-        df_search = df[df[name_col].astype(str).str.strip() == selected_name].copy()
+        # choose rows matching the display name we created
+        df_search = df[df['name_display'].astype(str).str.strip() == selected_name].copy()
     else:
         df_search = df.copy()
 
@@ -439,9 +439,12 @@ def main():
     # Player table (compact preview + expand)
     # Build display columns: cluster, name, and friendly labels mapped to chosen raw columns
     idcol = df.columns[0]
-    name_series_sub = get_display_name_series(sub)
     display_df = sub.copy()
-    display_df['name'] = name_series_sub
+    # Prefer the mapped human-readable name_display for the UI table; fall back to previous heuristics
+    if 'name_display' in display_df.columns:
+        display_df['name'] = display_df['name_display'].astype(str).str.strip()
+    else:
+        display_df['name'] = get_display_name_series(sub)
     display_cols = ['cluster', 'name']
     for label, raw in chosen_mapping.items():
         if raw in display_df.columns:
@@ -508,14 +511,16 @@ def main():
                 Xp = pca.fit_transform(Xs)
 
                 pxdf = pd.DataFrame(Xp, columns=['PC1','PC2'])
-                # safe name series: prefer merged 'name' column, fall back to get_display_name_series, then id
+                # safe name series: prefer name_display, then 'name', then get_display_name_series
                 idcol_local = sub.columns[0]
-                if 'name' in sub.columns:
+                if 'name_display' in sub.columns:
+                    name_series = sub['name_display'].astype(object)
+                elif 'name' in sub.columns:
                     name_series = sub['name'].astype(object)
                 else:
                     name_series = get_display_name_series(sub)
-                # ensure no nulls in hover name (use id as fallback)
-                name_filled = name_series.fillna(sub[idcol_local].astype(str)).astype(str)
+                # ensure no nulls in hover name (use empty string rather than id)
+                name_filled = name_series.fillna('').astype(str)
                 pxdf['name'] = name_filled.values
                 pxdf['id'] = sub[idcol_local].astype(str).values
                 pxdf['cluster'] = sub['cluster'].astype(str).values
@@ -553,8 +558,10 @@ def main():
             c2 = st.selectbox('Y feature', options=numeric_features, index=1 if len(numeric_features) > 1 else 0)
             try:
                 scatter_df = df[[c1, c2, 'cluster']].copy()
-                # ensure a name column for hover
-                if 'name' in df.columns:
+                # ensure a name column for hover (prefer name_display)
+                if 'name_display' in df.columns:
+                    scatter_df['name'] = df['name_display']
+                elif 'name' in df.columns:
                     scatter_df['name'] = df['name']
                 else:
                     scatter_df['name'] = df[df.columns[0]].astype(str)
@@ -590,9 +597,17 @@ def main():
         try:
             prow = df_search.iloc[0]
         except Exception:
-            # fallback: find first matching row in df
-            prow = df[df[name_col].astype(str).str.strip() == selected_name].iloc[0]
-        st.write('Player:', prow.get('name', prow[idcol]))
+            # fallback: find first matching row in df using name_display
+            prow = df[df['name_display'].astype(str).str.strip() == selected_name].iloc[0]
+        # show only the human-friendly display name if present
+        display_val = ''
+        if 'name_display' in prow.index and str(prow.get('name_display')).strip():
+            display_val = prow.get('name_display')
+        elif 'name' in prow.index and str(prow.get('name')).strip():
+            display_val = prow.get('name')
+        else:
+            display_val = ''
+        st.write('Player:', display_val)
         player_feats = prow[features].to_frame(name='player')
         # cluster centroid
         try:
