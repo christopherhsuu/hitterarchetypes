@@ -331,6 +331,55 @@ def main():
         return uniq
 
     choices = build_choices_from_df(df, idcol_main)
+    # Forced-name pass: ensure choices contain only human names by mapping ids -> names
+    # Build a single mapping dict from any available mapping CSVs (resolved relative to repo root)
+    forced_map = {}
+    for map_path in [ROOT.joinpath('data/raw/unique_batters_with_names.csv'), ROOT.joinpath('data/unique_batters_with_names.csv'), ROOT.joinpath('data/raw/unique_batters.csv')]:
+        if not map_path.exists():
+            continue
+        try:
+            mm = pd.read_csv(map_path, dtype=str)
+        except Exception:
+            continue
+        idc = next((c for c in mm.columns if c.lower() in ('batter','playerid','mlbam','id','key')), None)
+        namec = next((c for c in mm.columns if 'name' in c.lower() or 'full' in c.lower()), None)
+        if not idc or not namec:
+            if mm.shape[1] >= 2:
+                idc = mm.columns[0]
+                namec = mm.columns[1]
+            else:
+                continue
+        mm[idc] = mm[idc].astype(str).str.strip()
+        mm[namec] = mm[namec].astype(str).str.strip()
+        # update mapping; later files can override earlier ones
+        forced_map.update(mm.set_index(idc)[namec].to_dict())
+
+    # Build forced name list: prefer existing name_display, then name, then mapping via id
+    forced_names = []
+    id_keys = df[idcol_main].astype(str).astype(object)
+    for i, row in df.iterrows():
+        nm = ''
+        if 'name_display' in df.columns:
+            nm = str(row.get('name_display') or '').strip()
+        if not nm and 'name' in df.columns:
+            nm = str(row.get('name') or '').strip()
+        if not nm:
+            rid = str(row[idcol_main]).strip()
+            if rid in forced_map:
+                nm = forced_map[rid]
+        # Only include non-numeric, non-empty names
+        if nm and not nm.isdigit():
+            forced_names.append(nm)
+            # write back into name_display so downstream filtering works
+            try:
+                df.at[i, 'name_display'] = nm
+            except Exception:
+                pass
+
+    # Deduplicate and sort
+    forced_names = sorted(set(forced_names), key=lambda s: s.lower())
+    if forced_names:
+        choices = forced_names
     # quick in-app diagnostics to help deployments where mapping files may be missing
     total_players = len(df)
     mapped_names = 0
@@ -379,6 +428,43 @@ def main():
         direct_names = sorted(set([n for n in direct_names if n and not str(n).strip().isdigit()]), key=lambda s: s.lower())
         if direct_names:
             choices = direct_names
+            # Build a mapping dict from the mapping CSVs for ids -> name and write back into df['name_display']
+            direct_map = {}
+            for map_path in [ROOT.joinpath('data/raw/unique_batters_with_names.csv'), ROOT.joinpath('data/unique_batters_with_names.csv'), ROOT.joinpath('data/raw/unique_batters.csv')]:
+                if not map_path.exists():
+                    continue
+                try:
+                    mm = pd.read_csv(map_path, dtype=str)
+                except Exception:
+                    continue
+                idc = next((c for c in mm.columns if c.lower() in ('batter','playerid','mlbam','id','key')), None)
+                namec = next((c for c in mm.columns if 'name' in c.lower() or 'full' in c.lower()), None)
+                if not idc or not namec:
+                    if mm.shape[1] >= 2:
+                        idc = mm.columns[0]
+                        namec = mm.columns[1]
+                    else:
+                        continue
+                mm[idc] = mm[idc].astype(str).str.strip()
+                mm[namec] = mm[namec].astype(str).str.strip()
+                # only keep mapping for ids present in df
+                ids_in_df = set(df[idcol_main].astype(str).str.strip().unique())
+                filtered = mm[mm[idc].isin(ids_in_df)]
+                for _, r in filtered[[idc, namec]].dropna().iterrows():
+                    rid = str(r[idc]).strip()
+                    rname = str(r[namec]).strip()
+                    if rname and not rname.isdigit():
+                        direct_map[rid] = rname
+            # ensure name_display column exists and is string
+            if 'name_display' not in df.columns:
+                df['name_display'] = ''
+            # write mapped names into df where name_display is empty
+            try:
+                key_series = df[idcol_main].astype(str).str.strip()
+                mapped_vals = key_series.map(direct_map).fillna('')
+                df.loc[df['name_display'].astype(str).str.strip() == '', 'name_display'] = mapped_vals[df['name_display'].astype(str).str.strip() == '']
+            except Exception:
+                pass
             st.sidebar.success('Populated dropdown choices using mapping CSVs found in the repo.')
         else:
             # no mapping names available — do NOT silently fall back to ids unless user enabled it
