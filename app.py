@@ -204,6 +204,11 @@ def main():
     # try to merge external name mappings early so search uses human names
     df = merge_candidate_names(df)
 
+    # Normalize any human name columns on load so selection helpers get canonical strings
+    # If a 'name' column exists, normalize it; otherwise we'll merge-in names above.
+    if 'name' in df.columns:
+        df['name'] = df['name'].astype(str).str.strip()
+
     st.sidebar.header('Options')
     clusters = sorted(df['cluster'].astype(str).unique(), key=lambda x: (int(x) if x.isdigit() else x))
     sel_cluster = st.sidebar.selectbox('Cluster', ['All'] + clusters)
@@ -229,29 +234,68 @@ def main():
         chosen = st.sidebar.selectbox(f'{label} (raw)', options=available, index=0)
         chosen_mapping[label] = chosen
 
-    # Global player search at the top (live suggestions)
-    safe_names_all = get_display_name_series(df)
-    search_all = st.text_input('Search players (global)', value='')
-    selected_matches = []
-    if search_all:
-        q = search_all.strip().lower()
-        idcol = df.columns[0]
-        # matching names in the full dataset
-        name_mask = safe_names_all.str.lower().str.contains(q)
-        matches = sorted(safe_names_all[name_mask].unique())
-        if matches:
-            # allow user to pick one or more matching players
-            select_all_matches = st.checkbox(f'Select all {len(matches)} matches', value=False)
-            if select_all_matches:
-                selected_matches = matches
-            else:
-                selected_matches = st.multiselect('Matching players (choose one or more)', options=matches, default=[])
-        # apply filtering: selected matches take precedence, otherwise filter by substring or id
-        if selected_matches:
-            df_search = df[safe_names_all.isin(selected_matches)].copy()
+    # Player selection helpers
+    from utils.player_select import build_player_choices, build_player_summary, stable_widget_key
+
+    # Create canonical choices and summaries (use 'name' column if present)
+    name_col = 'name' if 'name' in df.columns else df.columns[0]
+    choices = build_player_choices(df, name_col=name_col, sort=True)
+    summaries = build_player_summary(df, name_col=name_col, season_col='Season')
+
+    st.sidebar.markdown('### Player selection')
+    select_mode = st.sidebar.radio('Selection mode', ['Primary (simple)', 'Disambiguation (name + year)', 'Substring filter', 'Fuzzy (optional)'])
+
+    selected_name = None
+    widget_key_base = stable_widget_key('player', df)
+
+    if select_mode == 'Primary (simple)':
+        # simple selectbox with deduplicated, alphabetically sorted names
+        selected_name = st.selectbox('Player', options=choices, key=widget_key_base + ':player-simple')
+
+    elif select_mode == 'Disambiguation (name + year)':
+        # Build options like 'Name (last: YEAR)' but return canonical Name
+        labels = []
+        for n in choices:
+            last, cnt = summaries.get(n, (None, 0))
+            label = f"{n} (last: {last})" if last is not None else f"{n}"
+            labels.append((label, n))
+        # Map displayed labels to canonical names
+        display_opts = [lab for lab, _ in labels]
+        choice_map = {lab: canon for lab, canon in labels}
+        sel = st.selectbox('Player', options=display_opts, key=widget_key_base + ':player-disamb')
+        selected_name = choice_map.get(sel)
+
+    elif select_mode == 'Substring filter':
+        q = st.text_input('Filter by substring (case-insensitive)', value='', key=widget_key_base + ':player-substr-input')
+        if q:
+            ql = q.strip().lower()
+            filtered = [c for c in choices if ql in c.lower()]
         else:
-            mask = name_mask | df[idcol].astype(str).str.lower().str.contains(q)
-            df_search = df[mask].copy()
+            filtered = choices
+        selected_name = st.selectbox('Player (filtered)', options=filtered, key=widget_key_base + ':player-substr-select')
+
+    elif select_mode == 'Fuzzy (optional)':
+        try:
+            from rapidfuzz import process
+            qf = st.text_input('Fuzzy search query', value='', key=widget_key_base + ':player-fuzzy-input')
+            if qf:
+                results = process.extract(qf, choices, limit=20)
+                # results: list of tuples (choice, score, idx)
+                top = [r[0] for r in results]
+            else:
+                top = []
+            if not top:
+                st.info('Enter a query above to get fuzzy matches')
+            else:
+                selected_name = st.selectbox('Fuzzy matches', options=top, key=widget_key_base + ':player-fuzzy-select')
+        except Exception:
+            st.warning('rapidfuzz not installed: install rapidfuzz to enable fuzzy search')
+            selected_name = st.selectbox('Player', options=choices, key=widget_key_base + ':player-fallback')
+
+    # After selection, filter the main DataFrame to the selected player (if any)
+    if selected_name:
+        # choose rows matching the canonical name
+        df_search = df[df[name_col].astype(str).str.strip() == selected_name].copy()
     else:
         df_search = df.copy()
 
@@ -468,19 +512,15 @@ def main():
     # Player detail: driven by top-search selections (no separate search box)
     st.subheader('Player detail')
     idcol = df.columns[0]
-    # If the top-search multiselect produced selected_matches, let the user pick one of them
-    chosen_player = None
-    if selected_matches:
-        chosen_player = st.selectbox('Choose a player from your search matches', options=selected_matches)
-    else:
-        st.info('Use the top search box to find players (type a substring like "jose"), then select one or more matches to view details.')
-
-    if chosen_player:
-        # find the row in the filtered `sub` or fall back to merged df
-        if chosen_player in sub.get('name', pd.Series()).tolist():
-            prow = sub[sub['name'] == chosen_player].iloc[0]
-        else:
-            prow = df[get_display_name_series(df) == chosen_player].iloc[0]
+    # Player detail driven by the new selection UI: `selected_name` (canonical Name string)
+    st.subheader('Player detail')
+    if selected_name:
+        # find the row in the filtered `df_search` (which contains rows for selected_name) or fall back to df
+        try:
+            prow = df_search.iloc[0]
+        except Exception:
+            # fallback: find first matching row in df
+            prow = df[df[name_col].astype(str).str.strip() == selected_name].iloc[0]
         st.write('Player:', prow.get('name', prow[idcol]))
         player_feats = prow[features].to_frame(name='player')
         # cluster centroid
