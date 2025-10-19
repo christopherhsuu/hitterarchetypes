@@ -16,6 +16,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# repository root resolved relative to this file — define at module scope so deployments that change cwd still work
+ROOT = Path(__file__).resolve().parent
+
 
 # Human-friendly feature descriptions for the Feature Index shown with the centroid heatmap
 FEATURE_DESCRIPTIONS = {
@@ -226,6 +229,7 @@ def load_diagnostics(path='out/cluster_plots/diagnostics.json'):
 def main():
     st.set_page_config(layout='wide', page_title='Cluster Archetypes')
     st.title('Cluster Archetypes Showcase')
+
 
     df = load_player_archetypes()
     diag = load_diagnostics()
