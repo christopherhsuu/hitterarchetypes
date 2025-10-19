@@ -73,8 +73,43 @@ def merge_candidate_names(main_df):
     """Attempt to enrich main_df with name columns from candidate files.
     Returns a new DataFrame (or the original if no merge succeeded).
     """
-    candidates = [Path('data/raw/unique_batters_with_names.csv'), Path('data/unique_batters_with_names.csv'), Path('data/raw/unique_batters.csv'), Path('data/unique_batters.csv')]
-    idcol = main_df.columns[0]
+    # Prefer the raw mapping file first
+    preferred = Path('data/raw/unique_batters_with_names.csv')
+    idcol_main = main_df.columns[0]
+    if preferred.exists():
+        try:
+            nm = pd.read_csv(preferred, dtype=str)
+            # find id column in mapping (common names)
+            id_candidates = [c for c in nm.columns if c.lower() in ('batter', 'playerid', 'mlbam', 'id', 'key')]
+            if not id_candidates:
+                # fallback: pick the column whose values intersect the main id column
+                for c in nm.columns:
+                    if nm[c].dropna().isin(main_df[idcol_main].astype(str).unique()).any():
+                        id_candidates = [c]
+                        break
+            # find name-like column
+            name_candidates = [c for c in nm.columns if 'name' in c.lower() or 'full' in c.lower() or 'display' in c.lower()]
+            if not name_candidates and nm.shape[1] >= 2:
+                name_candidates = [nm.columns[1]]
+            if id_candidates and name_candidates:
+                idc = id_candidates[0]
+                namec = name_candidates[0]
+                # build mapping dict (string keys)
+                map_series = nm[[idc, namec]].dropna()
+                map_series[idc] = map_series[idc].astype(str).str.strip()
+                map_series[namec] = map_series[namec].astype(str).str.strip()
+                mapping = map_series.set_index(idc)[namec].to_dict()
+                # create a name column by mapping the main id column
+                main_df = main_df.copy()
+                main_df['name'] = main_df[idcol_main].astype(str).str.strip().map(mapping)
+                # if any names still missing, leave them as original id string
+                main_df['name'] = main_df['name'].fillna(main_df[idcol_main].astype(str))
+                return main_df
+        except Exception:
+            pass
+
+    # Fallback: try other candidate files using the previous heuristic
+    candidates = [Path('data/unique_batters_with_names.csv'), Path('data/raw/unique_batters.csv'), Path('data/unique_batters.csv')]
     for pth in candidates:
         if not pth.exists():
             continue
@@ -82,20 +117,14 @@ def merge_candidate_names(main_df):
             nm = pd.read_csv(pth, dtype=str)
         except Exception:
             continue
-        # heuristics to pick id column in names file
-        id_candidates = [c for c in nm.columns if c.lower() in ('batter','playerid','mlbam','id','key')]
+        id_candidates = [c for c in nm.columns if c.lower() in ('batter', 'playerid', 'mlbam', 'id', 'key')]
         name_candidates = [c for c in nm.columns if 'name' in c.lower() or 'full' in c.lower() or 'display' in c.lower()]
         if not id_candidates:
-            # try intersecting values with main id column
-            common_col = None
             for c in nm.columns:
-                if nm[c].dropna().isin(main_df[idcol].astype(str).unique()).any():
-                    common_col = c
+                if nm[c].dropna().isin(main_df[idcol_main].astype(str).unique()).any():
+                    id_candidates = [c]
                     break
-            if common_col:
-                id_candidates = [common_col]
         if not name_candidates and nm.shape[1] >= 2:
-            # second column fallback
             name_candidates = [nm.columns[1]]
         if not id_candidates or not name_candidates:
             continue
@@ -104,7 +133,7 @@ def merge_candidate_names(main_df):
         nm_tmp = nm[[idc, namec]].copy()
         nm_tmp['__merge_key'] = nm_tmp[idc].apply(lambda x: str(x).strip() if pd.notna(x) else '')
         main_tmp = main_df.copy()
-        main_tmp['__merge_key'] = main_tmp[idcol].apply(lambda x: str(x).strip() if pd.notna(x) else '')
+        main_tmp['__merge_key'] = main_tmp[idcol_main].apply(lambda x: str(x).strip() if pd.notna(x) else '')
         merged = main_tmp.merge(nm_tmp[['__merge_key', namec]].rename(columns={namec: 'name'}), on='__merge_key', how='left')
         merged = merged.drop(columns=['__merge_key'])
         if merged['name'].notna().any():
