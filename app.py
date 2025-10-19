@@ -76,8 +76,7 @@ def merge_candidate_names(main_df):
     """Attempt to enrich main_df with name columns from candidate files.
     Returns a new DataFrame (or the original if no merge succeeded).
     """
-    # Prefer the raw mapping file first. Resolve relative to this file so deployments that change cwd still work.
-    ROOT = Path(__file__).resolve().parent
+    # Prefer the raw mapping file first. Use module-level ROOT to resolve paths.
     preferred = ROOT.joinpath('data/raw/unique_batters_with_names.csv')
     idcol_main = main_df.columns[0]
     if preferred.exists():
@@ -390,7 +389,6 @@ def main():
     if 'name_display' in df.columns:
         mapped_names = df['name_display'].astype(str).str.strip().replace('', pd.NA).dropna().shape[0]
     name_columns = [c for c in df.columns if 'name' in c.lower()]
-    ROOT = Path(__file__).resolve().parent
     map_files = [ROOT.joinpath('data/raw/unique_batters_with_names.csv'), ROOT.joinpath('data/unique_batters_with_names.csv')]
     present_map_files = [p.as_posix() for p in map_files if p.exists()]
     st.sidebar.markdown('### Data diagnostics')
