@@ -159,3 +159,101 @@ streamlit run app.py
 ---
 
 If you want, I can expand this README with concrete example commands for each script, add a short tutorial notebook that runs the pipeline end-to-end, or add a `deploy` guide for Streamlit Cloud. Tell me which you'd like next and I'll add it.
+
+## Features and pipeline used for clustering
+
+Below is an exact, explicit summary of the features, transforms, and algorithmic choices the repository uses to cluster players. Paste this into the README so users know what drives cluster membership.
+
+- Raw / aggregated features that may be produced by `scripts/cluster_archetypes.py` (when available):
+	- `n_swings` (per-player sample size)
+	- `whiff_rate` (shrinkage-smoothed whiff / swing-and-miss rate)
+	- `launch_speed_mean`, `launch_speed_std`, `launch_speed_median`, `launch_speed_p95`
+	- `pct_hard_hit` (proportion of batted balls above the hard-hit threshold)
+	- `launch_angle_mean`, `launch_angle_std`
+	- `gb_pct`, `ld_pct`, `fb_pct` (ground/line/fly percent bins derived from launch angles)
+	- `bat_speed_mean`, `bat_speed_std`
+	- `contact_rate` (per-player contact fraction — computed but typically removed before clustering)
+	- `swing_length_mean`, `attack_angle_mean`, `swing_path_tilt_mean`
+	- `intercept_ball_minus_batter_pos_x_inches_mean`, `intercept_ball_minus_batter_pos_y_inches_mean` (timing/offset measures)
+	- `attack_direction_mean` (circular mean in degrees)
+
+- Key transforms applied before clustering (as implemented in `scripts/cluster_archetypes.py`):
+	- Rate stabilizing transform: `whiff_rate` and `contact_rate` are converted with arcsin(sqrt(p)) (i.e., arcsin sqrt transform).
+	- Filtering: players with `n_swings` < `min_swings` (default 15) are excluded from clustering.
+	- Per-column winsorization: clip values at the 1st and 99th percentiles.
+	- MAD clipping: further clip each column to median ± k_mad * MAD (k_mad = 5) to limit heavy-tailed values.
+	- Near-constant removal: drop features with std < 1e-3.
+	- Correlation pruning: drop features whose absolute correlation > 0.92 with an earlier column (to reduce redundancy).
+	- Optional small scaling on `whiff_rate` (the script contains a guarded multiplier that may multiply whiff_rate by 0.2 in some branches before dropping `contact_rate`).
+	- Final scaling: `RobustScaler` is fit to the clipped/pruned numeric matrix and used as the input to KMeans.
+
+- Angle handling:
+	- `attack_direction_mean` is computed using a circular mean (in degrees) by the aggregator.
+	- For the interactive PCA visualization only, angle means are expanded to sin/cos pairs (e.g., `launch_angle_mean` -> `_sin` and `_cos`) to avoid wrap-around artifacts when plotting. The clustering script by default uses the aggregated circular mean (a numeric degree) rather than converting to sin/cos before KMeans.
+	- If you want circular-aware clustering distances, convert angle means to sin/cos before clustering (a recommended change if angles are a dominant signal).
+
+- Dimensionality reduction & diagnostics:
+	- PCA (n_components=2) is computed on the RobustScaler-transformed feature matrix for plotting and diagnostics.
+	- The PCA projection is only used for plotting (PCA axes are not used as primary clustering inputs in the default pipeline).
+
+- Clustering algorithm and k-selection:
+	- KMeans is used on the scaled feature matrix (Euclidean distance in scaled space).
+	- If `--k` is passed to `scripts/cluster_archetypes.py`, that k is forced. Otherwise `choose_k()` searches multiple k values and chooses k based on:
+		- Silhouette score (primary metric).
+		- Minimum cluster size / minimum cluster fraction constraints.
+		- Optional imbalance penalty (controlled by `imbalance_weight`).
+		- `silhouette_tol` allows candidates within tolerance of the best silhouette score; `prefer_larger_k` picks the largest k among candidates by default.
+
+- How membership is determined: players are assigned to whichever KMeans centroid is closest in the RobustScaler-transformed feature space — that is, clusters group players with similar values across the engineered features after winsorize/MAD clipping and robust scaling.
+
+- Where to check the concrete columns used in a particular run:
+	- After running `scripts/cluster_archetypes.py` the script writes `out/cluster_plots/diagnostics.json` and includes `params.features` — the exact list of numeric feature columns that were used for that run. The final per-player cluster assignments are written to `data/player_archetypes.csv` with a `cluster` column.
+
+- Practical notes and suggestions:
+	- The interactive UI already expands angles to sin/cos for improved PCA plots — consider applying the same expansion in `scripts/cluster_archetypes.py` if angular distances should be respected by KMeans.
+	- Keep scalers and transformation metadata if you plan to assign new players to existing clusters later (store the RobustScaler and any clipping thresholds).
+	- If you want a non-Euclidean treatment for angles or rates, replace or augment KMeans with a clustering algorithm that supports custom distance functions or compute a feature embedding that encodes your desired metric.
+
+If you want, I can also append an example snippet that prints `params.features` from the last diagnostics JSON or automatically injects the exact current feature list (from `data/player_archetypes.csv`) into the README so it always reflects the repo's current state.
+
+### Circular mean (degrees) — explanation and recommendations
+
+The aggregation code computes `attack_direction_mean` (and can do similar circular reductions) using a circular mean implemented in `scripts/cluster_archetypes.py`:
+
+```python
+def circ_mean_deg(s):
+	s = s.dropna()
+	if len(s) == 0:
+		return 0.0
+	r = np.deg2rad(s.values)
+	mean_angle = np.arctan2(np.mean(np.sin(r)), np.mean(np.cos(r)))
+	return np.rad2deg(mean_angle) % 360
+```
+
+Why this matters
+- Angles wrap around (0° ≡ 360°). Using a plain arithmetic mean on angles can give wrong results when values straddle the wrap point. The function above computes the circular mean properly and returns a value in degrees (0–360).
+
+How the pipeline uses it
+- The aggregator stores `attack_direction_mean` as a single-degree value (0–360). That value is included as a numeric feature for clustering by default.
+- For plotting only, the Streamlit app converts angle means to sin/cos pairs to avoid wrap-around artifacts in PCA plots; however the clustering script historically used the single circular-mean degree value.
+
+Pitfalls and caveats
+- Using a single-degree value in Euclidean distance (KMeans) treats the angle linearly, which can still be problematic if clusters are separated across the wrap boundary. Example: 359° and 1° are numerically far (358° apart) but are actually close in angle.
+
+Recommended approaches
+- Preferred (safe) approach: expand circular mean(s) into sin/cos components before clustering so angular differences are measured naturally in Euclidean space. Example:
+
+```python
+# Given a dataframe `df` with an angle-in-degrees column `attack_direction_mean`:
+rad = np.deg2rad(df['attack_direction_mean'].astype(float).fillna(0).values)
+df['attack_direction_sin'] = np.sin(rad)
+df['attack_direction_cos'] = np.cos(rad)
+# then drop the raw degree column before scaling/clustering
+df = df.drop(columns=['attack_direction_mean'])
+```
+
+- Alternative: perform clustering with a custom distance that accounts for angular wrap-around (less common; more work).
+
+Recommendation for this repo
+- If you expect angle-like features to be a major driver of cluster membership (they often are for swing direction/path), I recommend enabling sin/cos expansion in the clustering script. I can make that change for you (e.g., add an `--angle-sincos` flag that converts configured angle columns into sin/cos prior to pruning, clipping and scaling).
+

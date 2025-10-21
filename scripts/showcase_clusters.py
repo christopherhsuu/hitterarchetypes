@@ -58,6 +58,17 @@ def make_showcase(inp, outdir, id_col=None, cluster_col=None, features_arg=None)
     if 'n_swings' in df.columns and 'n_swings' not in features:
         features = ['n_swings'] + features
 
+    # Ensure feature columns are numeric (coerce malformed values to NaN).
+    # This makes aggregation robust when the input CSV contains stray strings.
+    try:
+        feat_cols = [f for f in features if f in df.columns]
+        if feat_cols:
+            df[feat_cols] = df[feat_cols].apply(pd.to_numeric, errors='coerce')
+    except Exception:
+        # If coercion fails for an unexpected reason, continue and let later code
+        # handle missing/NaN values; we don't want the whole script to crash here.
+        pass
+
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 

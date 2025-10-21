@@ -256,32 +256,54 @@ def main():
     feats = feats[feats['n_swings'] >= args.min_swings]
     if args.sample_frac < 1.0:
         feats = feats.sample(frac=args.sample_frac, random_state=42)
-    X_df = feats.drop(columns=['n_swings'], errors='ignore')
+    # Keep numeric features including sample-size columns (n_swings) so they can be used if desired.
+    X_df = feats.copy()
     X_df = X_df.select_dtypes(include=[np.number])
 
     if args.player_col in X_df.columns:
         X_df = X_df.drop(columns=[args.player_col])
 
     
+    # Preserve contact_rate by default (do not drop it automatically). Optionally scale whiff_rate slightly
     if 'contact_rate' in X_df.columns:
         try:
-            
             if 'whiff_rate' in X_df.columns:
                 X_df['whiff_rate'] = X_df['whiff_rate'] * 0.2
         except Exception:
             pass
-        X_df = X_df.drop(columns=['contact_rate'], errors='ignore')
     
+    # Protect a canonical set of features from being dropped by variance/correlation heuristics.
+    CANONICAL_FEATURES = [
+        'n_swings', 'whiff_rate',
+        'launch_speed_mean', 'launch_speed_std', 'launch_speed_median', 'launch_speed_p95', 'pct_hard_hit',
+        'launch_angle_mean', 'launch_angle_std', 'gb_pct', 'ld_pct', 'fb_pct',
+        'bat_speed_mean', 'bat_speed_std', 'contact_rate',
+        'swing_length_mean', 'attack_angle_mean', 'swing_path_tilt_mean',
+        'intercept_ball_minus_batter_pos_x_inches_mean', 'intercept_ball_minus_batter_pos_y_inches_mean',
+        'attack_direction_mean'
+    ]
+    canonical_present = [c for c in CANONICAL_FEATURES if c in X_df.columns]
+
     low_var = X_df.std() < 1e-3
-    if low_var.any():
-        print("Dropping near-constant features:", list(X_df.columns[low_var]))
-        X_df = X_df.loc[:, ~low_var]
+    # Only drop low-variance columns that are NOT in the canonical set
+    drop_low_cols = [c for c, v in low_var.items() if v and c not in canonical_present]
+    if drop_low_cols:
+        print("Dropping near-constant features:", drop_low_cols)
+        X_df = X_df.drop(columns=drop_low_cols)
     
     core_cols = [c for c in ['launch_speed_mean','bat_speed_mean','launch_angle_mean'] if c in X_df.columns]
     if core_cols:
         X_df = X_df[X_df[core_cols].sum(axis=1) != 0]
     
     X_df = X_df.dropna()
+    # Log-transform count-like columns (including n_swings) so counts are on a comparable scale
+    count_cols = [c for c in X_df.columns if c.lower().startswith('n_') or c.lower().endswith('_count') or c.lower() == 'n_swings']
+    for c in count_cols:
+        try:
+            X_df[c] = np.log1p(X_df[c].astype(float).fillna(0))
+        except Exception:
+            pass
+
     for col in X_df.columns:
         lo, hi = X_df[col].quantile([0.01, 0.99])
         X_df[col] = X_df[col].clip(lo, hi)
@@ -292,9 +314,18 @@ def main():
         for c2 in cols[i+1:]:
             try:
                 if corr.loc[c1, c2] > 0.92:
-                    to_drop.add(c2)
+                    # Prefer to drop the non-canonical column when a canonical and non-canonical column are highly correlated.
+                    if c2 in canonical_present and c1 not in canonical_present:
+                        to_drop.add(c1)
+                    elif c1 in canonical_present and c2 not in canonical_present:
+                        to_drop.add(c2)
+                    else:
+                        # If neither or both are canonical, drop c2 (original behavior) but ensure canonical columns are not removed below.
+                        to_drop.add(c2)
             except Exception:
                 continue
+    # Ensure we do not drop canonical features
+    to_drop = [c for c in to_drop if c not in canonical_present]
     if to_drop:
         print("Dropping highly correlated:", sorted(to_drop))
         X_df = X_df.drop(columns=sorted(to_drop))
